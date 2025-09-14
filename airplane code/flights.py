@@ -6,9 +6,10 @@ import random
 import os
 
 # Set random seeds for reproducibility
-NUM = 32
-random.seed(NUM)
-np.random.seed(NUM)
+seed_bytes = os.urandom(4)
+seed_int = int.from_bytes(seed_bytes, byteorder='big')
+random.seed(seed_int)
+np.random.seed(seed_int)
 
 # Constants
 TARGET_YEAR = 2024

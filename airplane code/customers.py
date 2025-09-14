@@ -15,7 +15,7 @@ np.random.seed(seed_int)
 
 
 # Constants
-TARGET_YEAR = 2024
+TARGET_YEAR = 2020
 NUM_INDIVIDUALS = random.randint(random.randint(70000, 200000), random.randint(200000, 500000))
 ENTRY_MODES = ['Website', 'Mobile Application', 'Agent', 'Walk-in']
 
@@ -134,7 +134,7 @@ class Person:
         # Ensure 60% South Africans
         self.nationality = random.choices(
             ['South Africa'] + [c for c in PHONE_PLANS.keys() if c != 'South Africa'],
-            weights=[0.6] + [0.4 / (len(PHONE_PLANS) - 1)] * (len(PHONE_PLANS) - 1)
+            weights=[(random.randint(60, 100) / 100) * 1.00] + [((random.randint(20, 40) / 100) * 1.00) / (len(PHONE_PLANS) - 1)] * (len(PHONE_PLANS) - 1)
         )[0]
         self.faker = FAKER_INSTANCES[self.nationality]
         self.client_id = client_id

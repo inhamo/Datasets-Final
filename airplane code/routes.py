@@ -6,11 +6,13 @@ import random
 import os
 
 # Set random seeds for reproducibility
-random.seed(12)
-np.random.seed(12)
+seed_bytes = os.urandom(4)
+seed_int = int.from_bytes(seed_bytes, byteorder='big')
+random.seed(seed_int)
+np.random.seed(seed_int)
 
 # Constants
-TARGET_YEAR = 2024
+TARGET_YEAR = 2020
 
 # Airport database with detailed information
 AIRPORTS = {
@@ -71,9 +73,9 @@ def calculate_duration(distance_km):
 
 def get_available_airports(year):
     """Get available airports based on the target year."""
-    if year == 2013:
+    if year == 2020:
         return {code: info for code, info in AIRPORTS.items() if info['country'] == 'South Africa'}
-    elif year == 2014:
+    elif year == 2021:
         return {code: info for code, info in AIRPORTS.items() if info['country'] in ['South Africa', 'Zimbabwe', 'Kenya', 'Nigeria']}
     else:
         return AIRPORTS
@@ -186,3 +188,4 @@ if __name__ == "__main__":
     print("=" * 60)
     sample_cols = ['route_id', 'origin_airport', 'destination_airport', 'distance_km', 'estimated_duration_hrs', 'flight_category']
     print(routes_data[sample_cols].head(10).to_string(index=False))
+    
