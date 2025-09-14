@@ -6,9 +6,11 @@ import random
 import os
 
 # Set random seeds for reproducibility
-NUM = 30
-random.seed(NUM)
-np.random.seed(NUM)
+# Set random seeds for reproducibility
+seed_bytes = os.urandom(4)
+seed_int = int.from_bytes(seed_bytes, byteorder='big')
+random.seed(seed_int)
+np.random.seed(seed_int)
 
 # Constants
 TARGET_YEAR = 2024
@@ -137,7 +139,7 @@ POPULAR_FLIGHT_TIMES = {
 }
 
 # Fixed flight times for other routes
-OTHER_FLIGHT_TIMES = [8, 12, 16]
+OTHER_FLIGHT_TIMES = [6, 8, 12, 16, 20]
 
 def load_datasets():
     """Load and concatenate planes and routes datasets for all years from BASE_YEAR to TARGET_YEAR."""
