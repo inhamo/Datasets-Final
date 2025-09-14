@@ -420,7 +420,7 @@ def generate_realistic_fast_checkins(target_year=2021, save_file=True):
         raise
 
 if __name__ == "__main__":
-    TARGET_YEAR = 2022
+    TARGET_YEAR = 2024
     checkins = generate_realistic_fast_checkins(
         target_year=TARGET_YEAR,
         save_file=True
