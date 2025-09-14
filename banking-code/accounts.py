@@ -260,7 +260,7 @@ def generate_accounts(year):
                 credit_limit = generate_credit_limit(acc_type, income_level)
 
                 accounts.append({
-                    'account_id': f'ACC{account_id_counter:07d}',
+                    'account_id': f'ACC{year}{account_id_counter:07d}',
                     'customer_id': customer_id,
                     'account_type': acc_type,
                     'opening_date': opening_date,
@@ -302,7 +302,7 @@ def generate_accounts(year):
             credit_limit = generate_credit_limit('joint', income_level)
 
             accounts.append({
-                'account_id': f'ACC{account_id_counter:07d}',
+                'account_id': f'ACC{year}{account_id_counter:07d}',
                 'customer_id': customer_id,
                 'account_type': 'joint',
                 'opening_date': opening_date,
@@ -348,7 +348,7 @@ def generate_accounts(year):
             credit_limit = generate_credit_limit(acc_type, income_level)
 
             accounts.append({
-                'account_id': f'ACC{account_id_counter:07d}',
+                'account_id': f'ACC{year}{account_id_counter:07d}',
                 'customer_id': customer_id,
                 'account_type': acc_type,
                 'opening_date': opening_date,
@@ -397,6 +397,6 @@ def generate_accounts_with_relationships(customer_data, year):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate account data for a specific year")
-    parser.add_argument('--year', type=int, default=2024, help='Year for account data generation')
+    parser.add_argument('--year', type=int, default=2020, help='Year for account data generation')
     args = parser.parse_args()
     generate_accounts(args.year)
