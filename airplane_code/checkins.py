@@ -54,7 +54,7 @@ class RealisticFastCheckInsGenerator:
         }
         
         # Initialize Faker for realistic names
-        self.faker = Faker(['en_US', 'en_GB', 'en_ZA'])
+        self.faker = Faker(['en_US', 'en_GB', 'zu_ZA'])
         
         # Pre-generate some random values for speed (but keep realistic logic)
         self._pregenerate_some_values()
@@ -420,7 +420,7 @@ def generate_realistic_fast_checkins(target_year=2021, save_file=True):
         raise
 
 if __name__ == "__main__":
-    TARGET_YEAR = 2021
+    TARGET_YEAR = 2022
     checkins = generate_realistic_fast_checkins(
         target_year=TARGET_YEAR,
         save_file=True
