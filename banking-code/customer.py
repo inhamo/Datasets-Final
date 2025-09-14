@@ -8,6 +8,7 @@ from tqdm import tqdm
 from occupations import get_occupations_data
 from cities import get_cities_data
 from phone_numbers import generate_phone_number
+from names import generate_name
 
 def generate_customer_data(year):
     # Initialize seeds for reproducibility
@@ -34,43 +35,6 @@ def generate_customer_data(year):
     else:
         num_individuals = random.randint(15000, 22000)
         num_companies = random.randint(1, 10)
-
-    # Pre-compute name groups
-    name_groups = {
-        'Black': [
-            ('Sipho', 'Mokoena'), ('Thabo', 'Nkosi'), ('Nokuthula', 'Dlamini'), ('Lerato', 'Mthembu'),
-            ('Tshepo', 'Zulu'), ('Palesa', 'Mabena'), ('Sibusiso', 'Ndlovu'), ('Thandiwe', 'Khumbuza'),
-            ('Mpho', 'Mkhize'), ('Zanele', 'Ngobeni'), ('Bongani', 'Sithole'), ('Nomvula', 'Mahlangu'),
-            ('Thulani', 'Tshabalala'), ('Khanyisile', 'Mnguni'), ('Siyabonga', 'Khoza'),
-            ('Nompumelelo', 'Buthelezi'), ('Lungile', 'Mofokeng'), ('Zodwa', 'Hlatshwayo'),
-            ('Mandla', 'Zungu'), ('Busisiwe', 'Mtshali')
-        ],
-        'Afrikaans': [
-            ('Jan', 'van der Merwe'), ('Pieter', 'Botha'), ('Elsa', 'Smit'), ('Marelize', 'Kruger'),
-            ('Johan', 'Pretorius'), ('Annelise', 'Venter'), ('Hendrik', 'de Klerk'), ('Marike', 'Coetzee'),
-            ('Willem', 'van Wyk'), ('Lizette', 'Nel'), ('Christo', 'du Plessis'), ('Elmarie', 'Steyn'),
-            ('Gerhard', 'Fourie'), ('Anri', 'le Roux'), ('Jacques', 'Pienaar'), ('Susanna', 'Swart')
-        ],
-        'English': [
-            ('John', 'Smith'), ('Mary', 'Brown'), ('David', 'Johnson'), ('Grace', 'Williams'),
-            ('Michael', 'Taylor'), ('Emma', 'Wilson'), ('James', 'Davis'), ('Sarah', 'Clark'),
-            ('William', 'Harris'), ('Elizabeth', 'Lewis'), ('Thomas', 'Walker'), ('Rebecca', 'Hall')
-        ],
-        'Indian': [
-            ('Rajesh', 'Naidoo'), ('Aisha', 'Pillay'), ('Sunil', 'Singh'), ('Nisha', 'Patel'),
-            ('Amit', 'Govender'), ('Priya', 'Chetty'), ('Vikram', 'Reddy'), ('Anjali', 'Naicker')
-        ],
-        'Coloured': [
-            ('Rene', 'Adams'), ('Liezl', 'Davids'), ('Abdul', 'Williams'), ('Fazila', 'Johnson'),
-            ('Waseem', 'Abrahams'), ('Natasha', 'Jacobs'), ('Ibrahim', 'Petersen'), ('Shereen', 'Fortuin')
-        ]
-    }
-    zw_names = [
-        ('Tariro', 'Dube'), ('Farai', 'Moyo'), ('Kudzai', 'Chirwa'), ('Ruvimbo', 'Ndlovu'),
-        ('Tatenda', 'Sibanda'), ('Chipo', 'Mhlope'), ('Tinashe', 'Gumbo'), ('Nyasha', 'Mapfumo')
-    ]
-    ethnicity_probs = np.array([0.75, 0.14, 0.07, 0.025, 0.085])
-    ethnicity_keys = list(name_groups.keys())
 
     # Pre-compute education levels
     education_levels = [
@@ -102,7 +66,6 @@ def generate_customer_data(year):
     provinces, cities, province_probs = get_cities_data()
 
     def generate_batch_individuals(batch_size):
-        is_sa_batch = np.random.random(batch_size) < 0.85
         ages = np.random.choice(age_ranges, size=batch_size, p=age_weights)
         genders = np.random.choice(['M', 'F'], size=batch_size, p=[0.49, 0.51])
         education_batch = np.random.choice(education_levels, size=batch_size, p=education_probs)
@@ -131,25 +94,14 @@ def generate_customer_data(year):
         results = []
         for i in range(batch_size):
             idx = len(results) + 1
-            is_sa = is_sa_batch[i]
             age = int(ages[i])
             gender = genders[i]
             occupation = occupations_batch[i]
             province = provinces_batch[i]
             education = education_batch[i]
 
-            # Generate name and nationality
-            if is_sa:
-                ethnicity_idx = np.random.choice(len(ethnicity_keys), p=ethnicity_probs)
-                ethnicity = ethnicity_keys[ethnicity_idx]
-                first, last = random.choice(name_groups[ethnicity])
-                nationality = 'South Africa'
-                citizenship = 'ZA'
-            else:
-                first, last = random.choice(zw_names)
-                nationality = 'Zimbabwe'
-                citizenship = 'ZW'
-                ethnicity = 'Foreign National'
+            # Generate name, nationality, citizenship, and ethnicity
+            full_name, nationality, citizenship, ethnicity = generate_name()
 
             # Generate income and risk
             income_range = income_ranges[occupation]['range']
@@ -183,18 +135,18 @@ def generate_customer_data(year):
             results.append({
                 'customer_id': f'IND{year % 100}{idx:06d}',
                 'customer_type': 'Individual',
-                'full_name': f"{first} {last}",
+                'full_name': full_name,
                 'birth_date': birth_date,
                 'citizenship': citizenship,
                 'residential_address': address,
                 'commercial_address': None,
                 'email': fake.email(),
                 'phone_number': phone_number,
-                'id_type': 'National ID' if is_sa else 'Passport',
+                'id_type': 'National ID' if nationality == 'South Africa' else 'Passport',
                 'id_number': id_number,
-                'expiry_date': None if is_sa else fake.future_date(end_date='+3y'),
-                'visa_type': None if is_sa else 'Work',
-                'visa_expiry_date': None if is_sa else fake.future_date(end_date='+2y'),
+                'expiry_date': None if nationality == 'South Africa' else fake.future_date(end_date='+3y'),
+                'visa_type': None if nationality == 'South Africa' else 'Work',
+                'visa_expiry_date': None if nationality == 'South Africa' else fake.future_date(end_date='+2y'),
                 'is_pep': random.random() < 0.01,
                 'sanctioned_country': False,
                 'risk_score': risk_score,
@@ -313,7 +265,7 @@ def generate_customer_data(year):
         df = df.sample(frac=1, random_state=seed_int).reset_index(drop=True)
 
     # Save to file
-    github_repo_path = '/content/Datasets-Final'
+    github_repo_path = 'banking_data'
     os.makedirs(github_repo_path, exist_ok=True)
     output_file = f'{github_repo_path}/customers_{year}.parquet'
     df.to_parquet(output_file, index=False)
@@ -325,5 +277,5 @@ def generate_customer_data(year):
 
 if __name__ == "__main__":
     # Example: Generate for a single year
-    year = 2023
+    year = 2024
     generate_customer_data(year)
