@@ -1,291 +1,217 @@
 import pandas as pd
 import numpy as np
 from faker import Faker
+from datetime import datetime, date, timedelta
+from tqdm import tqdm
 import random
 import os
-from datetime import date, timedelta
-from tqdm import tqdm
 import re
 
-fake = Faker()
-random.seed(42)
-np.random.seed(42)
+# Set random seeds for reproducibility
+seed_bytes = os.urandom(4)
+seed_int = int.from_bytes(seed_bytes, byteorder='big')
+random.seed(seed_int)
+np.random.seed(seed_int)
 
-NUM_INDIVIDUALS = random.randint(25865, 389272)
-NUM_COMPANIES = 40
 
-ENTRY_MODES = ['Website', 'Application', 'Agent', 'Walk-in']
+# Constants
+TARGET_YEAR = 2024
+NUM_INDIVIDUALS = random.randint(random.randint(70000, 200000), random.randint(200000, 500000))
+ENTRY_MODES = ['Website', 'Mobile Application', 'Agent', 'Walk-in']
 
-# Country-to-province-to-city mapping
-COUNTRY_PROVINCES_CITIES = {
-    'South Africa': {
-        'Western Cape': ['Cape Town', 'Stellenbosch', 'George'],
-        'Gauteng': ['Johannesburg', 'Pretoria', 'Soweto'],
-        'KwaZulu-Natal': ['Durban', 'Pietermaritzburg']
-    },
-    'United Kingdom': {
-        'England': ['London', 'Manchester', 'Birmingham'],
-        'Scotland': ['Edinburgh', 'Glasgow'],
-        'Wales': ['Cardiff']
-    },
-    'United States': {
-        'California': ['Los Angeles', 'San Francisco', 'San Diego'],
-        'New York': ['New York City', 'Buffalo'],
-        'Texas': ['Houston', 'Austin']
-    },
-    'Canada': {
-        'Ontario': ['Toronto', 'Ottawa'],
-        'British Columbia': ['Vancouver', 'Victoria'],
-        'Quebec': ['Montreal', 'Quebec City']
-    },
-    'Germany': {
-        'Bavaria': ['Munich', 'Nuremberg'],
-        'Berlin': ['Berlin'],
-        'Hamburg': ['Hamburg']
-    },
-    'Zimbabwe': {
-        'Harare': ['Harare'],
-        'Bulawayo': ['Bulawayo'],
-        'Manicaland': ['Mutare']
-    },
-    'India': {
-        'Maharashtra': ['Mumbai', 'Pune'],
-        'Delhi': ['New Delhi'],
-        'Karnataka': ['Bangalore']
-    },
-    'Other': {
-        'Generic Province': ['Generic City']  # Renamed for clarity
-    }
-}
-
-# Phone number plans
+# Phone plans dictionary with Faker locales
 PHONE_PLANS = {
-    'South Africa': {'cc': '+27', 'nsn_length': 9, 'mobile_prefixes': ['60', '71', '82']},
-    'United Kingdom': {'cc': '+44', 'nsn_length': 10, 'mobile_prefixes': ['7']},
-    'United States': {'cc': '+1', 'nsn_length': 10, 'mobile_prefixes': ['2', '3', '4', '5', '6', '7', '8', '9']},
-    'Canada': {'cc': '+1', 'nsn_length': 10, 'mobile_prefixes': ['2', '3', '4', '5', '6', '7', '8', '9']},
-    'Germany': {'cc': '+49', 'nsn_length': 10, 'mobile_prefixes': ['15', '16', '17']},
-    'Zimbabwe': {'cc': '+263', 'nsn_length': 9, 'mobile_prefixes': ['71', '73', '77']},
-    'India': {'cc': '+91', 'nsn_length': 10, 'mobile_prefixes': ['7', '8', '9']},
+    'South Africa': {'cc': '+27', 'nsn_length': 9, 'mobile_prefixes': ['60','61','62','63','64','65','66','67','68','71','72','73','74','76','78','79','81','82','83','84'], 'faker_locale': 'zu_ZA'},
+    'United Kingdom': {'cc': '+44', 'nsn_length': 10, 'mobile_prefixes': ['7'], 'faker_locale': 'en_GB'},
+    'United States': {'cc': '+1', 'nsn_length': 10, 'mobile_prefixes': ['2','3','4','5','6','7','8','9'], 'faker_locale': 'en_US'},
+    'Canada': {'cc': '+1', 'nsn_length': 10, 'mobile_prefixes': ['2','3','4','5','6','7','8','9'], 'faker_locale': 'en_CA'},
+    'Germany': {'cc': '+49', 'nsn_length': 10, 'mobile_prefixes': ['15','16','17'], 'faker_locale': 'de_DE'},
+    'France': {'cc': '+33', 'nsn_length': 9, 'mobile_prefixes': ['6','7'], 'faker_locale': 'fr_FR'},
+    'India': {'cc': '+91', 'nsn_length': 10, 'mobile_prefixes': ['6','7','8','9'], 'faker_locale': 'hi_IN'},
+    'Nigeria': {'cc': '+234', 'nsn_length': 10, 'mobile_prefixes': ['70','80','81','90','91'], 'faker_locale': 'en_GB'},
+    'Zimbabwe': {'cc': '+263', 'nsn_length': 9, 'mobile_prefixes': ['71','73','77','78'], 'faker_locale': 'en_GB'},
+    'Kenya': {'cc': '+254', 'nsn_length': 9, 'mobile_prefixes': ['7','1'], 'faker_locale': 'en_GB'},
+    'Australia': {'cc': '+61', 'nsn_length': 9, 'mobile_prefixes': ['4'], 'faker_locale': 'en_AU'},
+    'Brazil': {'cc': '+55', 'nsn_length': 11, 'mobile_prefixes': ['9'], 'faker_locale': 'pt_BR'},
+    'United Arab Emirates': {'cc': '+971', 'nsn_length': 9, 'mobile_prefixes': ['50','52','54','55','56','58'], 'faker_locale': 'ar_AE'},
+    'Netherlands': {'cc': '+31', 'nsn_length': 9, 'mobile_prefixes': ['6'], 'faker_locale': 'nl_NL'},
+    'Spain': {'cc': '+34', 'nsn_length': 9, 'mobile_prefixes': ['6','7'], 'faker_locale': 'es_ES'},
+    'Italy': {'cc': '+39', 'nsn_length': 10, 'mobile_prefixes': ['3'], 'faker_locale': 'it_IT'},
+    'China': {'cc': '+86', 'nsn_length': 11, 'mobile_prefixes': ['13','14','15','16','17','18','19'], 'faker_locale': 'zh_CN'},
+    'Japan': {'cc': '+81', 'nsn_length': 10, 'mobile_prefixes': ['70','80','90'], 'faker_locale': 'ja_JP'},
 }
 
-# ID and Passport formats
-ID_PASSPORT_FORMATS = {
-    'South Africa': {
-        'ID': lambda: ''.join(str(random.randint(0,9)) for _ in range(13)),
-        'Passport': lambda: fake.bothify(text='A#######')
-    },
-    'United Kingdom': {
-        'ID': lambda: fake.bothify(text='??######'),
-        'Passport': lambda: ''.join(str(random.randint(0,9)) for _ in range(9))
-    },
-    'United States': {
-        'ID': lambda: fake.bothify(text='###-##-####'),
-        'Passport': lambda: ''.join(str(random.randint(0,9)) for _ in range(9))
-    },
-    'Canada': {
-        'ID': lambda: fake.bothify(text='###-###-###'),
-        'Passport': lambda: fake.bothify(text='??######')
-    },
-    'Germany': {
-        'ID': lambda: ''.join(str(random.randint(0,9)) for _ in range(11)),
-        'Passport': lambda: fake.bothify(text='C##???###')
-    },
-    'Zimbabwe': {
-        'ID': lambda: fake.bothify(text='##-######-?##'),
-        'Passport': lambda: fake.bothify(text='??######')  # 2 letters + 6 digits
-    },
-    'India': {
-        'ID': lambda: ''.join(str(random.randint(0,9)) for _ in range(12)),
-        'Passport': lambda: fake.bothify(text='?########')
-    },
+# Initialize Faker instances for each country
+FAKER_INSTANCES = {country: Faker(locale) for country, details in PHONE_PLANS.items() for locale in [details['faker_locale']]}
+
+# City and province lists for Zimbabwe, Kenya, and Nigeria
+COUNTRY_CITIES_PROVINCES = {
+    'Zimbabwe': [
+        {'city': 'Harare', 'province': 'Harare'},
+        {'city': 'Bulawayo', 'province': 'Bulawayo'},
+        {'city': 'Mutare', 'province': 'Manicaland'},
+        {'city': 'Gweru', 'province': 'Midlands'},
+        {'city': 'Masvingo', 'province': 'Masvingo'}
+    ],
+    'Kenya': [
+        {'city': 'Nairobi', 'province': 'Nairobi'},
+        {'city': 'Mombasa', 'province': 'Coast'},
+        {'city': 'Kisumu', 'province': 'Nyanza'},
+        {'city': 'Nakuru', 'province': 'Rift Valley'},
+        {'city': 'Eldoret', 'province': 'Rift Valley'}
+    ],
+    'Nigeria': [
+        {'city': 'Lagos', 'province': 'Lagos'},
+        {'city': 'Abuja', 'province': 'Federal Capital Territory'},
+        {'city': 'Kano', 'province': 'Kano'},
+        {'city': 'Ibadan', 'province': 'Oyo'},
+        {'city': 'Port Harcourt', 'province': 'Rivers'}
+    ]
 }
 
-# Company registration number formats
-COMPANY_REG_FORMATS = {
-    'South Africa': lambda: f'{random.randint(1000,9999)}/{random.randint(100000,999999)}/07',
-    'United Kingdom': lambda: ''.join(str(random.randint(0,9)) for _ in range(8)),
-    'United States': lambda: fake.bothify(text='##-#######'),
-    'Canada': lambda: ''.join(str(random.randint(0,9)) for _ in range(9)),
-    'Germany': lambda: fake.bothify(text='HRB ######'),
-    'Zimbabwe': lambda: f'CR/{random.randint(1000,9999)}/{random.randint(20,25)}',
-    'India': lambda: fake.bothify(text='U#####MH####PTC###'),
-}
-
-# TLD suggestions
-COUNTRY_TLDS = {
-    'South Africa': '.co.za',
-    'United Kingdom': '.co.uk',
-    'United States': '.com',
-    'Canada': '.ca',
-    'Germany': '.de',
-    'Zimbabwe': '.zw',
-    'India': '.in',
-}
-
-def clean_domain(name: str) -> str:
-    base = name.lower()
-    base = re.sub(r'[^a-z0-9]+', '', base)
-    return base or 'company'
-
-def tld_for_country(country: str) -> str:
-    return COUNTRY_TLDS.get(country, '.com')
-
-def phone_for_country(country: str) -> str:
-    plan = PHONE_PLANS.get(country, PHONE_PLANS['United States'])
-    cc = plan['cc']
-    prefix = random.choice(plan['mobile_prefixes'])
-    remaining = plan['nsn_length'] - len(prefix)
-    tail = ''.join(str(random.randint(0,9)) for _ in range(max(0, remaining)))
-    if cc == '+1':
-        area_first = str(random.randint(2,9))
-        area_rest = ''.join(str(random.randint(0,9)) for _ in range(2))
-        exch_first = str(random.randint(2,9))
-        exch_rest = ''.join(str(random.randint(0,9)) for _ in range(2))
-        line = ''.join(str(random.randint(0,9)) for _ in range(4))
-        return f"{cc}{area_first}{area_rest}{exch_first}{exch_rest}{line}"
-    return f"{cc}{prefix}{tail}"
-
-def country_from_headquarters(hq: str) -> str:
-    if not isinstance(hq, str):
-        return 'Other'  # Use 'Other' for invalid HQ
-    parts = [p.strip() for p in hq.split(',') if p.strip()]
-    return parts[-1] if parts else 'Other'
-
-def get_province_city(country: str) -> tuple:
-    # Handle unmapped countries
-    if country not in COUNTRY_PROVINCES_CITIES:
-        country = 'Other'
-    provinces = COUNTRY_PROVINCES_CITIES[country]
-    province = random.choice(list(provinces.keys()))
-    city = random.choice(provinces[province])
-    return province, city
-
-def generate_individual_data(num):
-    data = []
-    for _ in tqdm(range(num), desc="Generating Individuals"):
-        name = fake.name()
-        dob = fake.date_of_birth(minimum_age=18, maximum_age=80)
-        gender = random.choices(['M', 'F', 'Other', 'Prefer not to say'], weights=[0.48, 0.48, 0.02, 0.02])[0]
-        nationality = random.choice(list(PHONE_PLANS.keys()))
-
-        state, city = get_province_city(nationality)
-        id_type = random.choices(['ID', 'Passport', "Driver's License"], weights=[0.6, 0.3, 0.1])[0]
-        formats = ID_PASSPORT_FORMATS.get(nationality, ID_PASSPORT_FORMATS['United States'])
-        if id_type == 'ID':
-            id_number = formats['ID']()
-            expiry = None
-        elif id_type == 'Passport':
-            id_number = formats['Passport']()
-            expiry = fake.date_between(start_date=date(2016, 1, 1), end_date=date(2025, 12, 31))
+def generate_id_number(nationality, id_type, dob, gender, faker):
+    """Generate ID number based on nationality and ID type."""
+    if id_type == 'National ID':
+        if nationality == 'South Africa':
+            dob_str = dob.strftime('%y%m%d')
+            seq = f'{random.randint(0, 9999):04d}'
+            gender_digit = '0' if gender == 'F' else '1'
+            citizenship = random.choice(['0', '1'])
+            check_digit = random.randint(0, 9)
+            return f'{dob_str}{seq}{gender_digit}{citizenship}{check_digit}'
         else:
-            id_number = fake.bothify(text='??######')
-            expiry = None
+            raise ValueError("National ID is only allowed for South Africans")
+    elif id_type == 'Passport':
+        if nationality == 'South Africa':
+            return f'{random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")}{random.randint(10000000, 99999999)}'
+        elif nationality in ['United States', 'Canada']:
+            return f'{random.randint(100000000, 999999999)}'
+        else:
+            return f'{random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")}{random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")}{random.randint(1000000, 9999999)}'
+    else:  # Driver's License
+        if nationality == 'South Africa':
+            initials = ''.join([name[0] for name in faker.name().split()[:2]]).upper()
+            dob_str = dob.strftime('%y%m%d')
+            seq = f'{random.randint(0, 9999):04d}'
+            return f'{initials}{dob_str}{seq}'
+        elif nationality in ['United States', 'Canada']:
+            return f'D{random.randint(10000000, 99999999)}'
+        else:
+            return f'{random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")}{random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")}{random.randint(10000000, 99999999)}'
 
-        email_local = re.sub(r'[^a-z0-9]+', '.', name.lower())
-        email = f"{email_local}@{random.choice(['gmail.com', 'yahoo.com', 'outlook.com', 'icloud.com'])}"
-        phone = phone_for_country(nationality)
-        marketing_consent = random.choice([True, False])
-        comm_pref = random.choice(['Email', 'SMS', 'Phone', 'Mail'])
-        date_registered = fake.date_between(start_date=date(2000, 1, 1), end_date=date.today())
-        blacklist_flag = random.random() < 0.02
-        blacklist_date = fake.date_between(start_date=date_registered + timedelta(days=1), end_date=date.today()) if blacklist_flag else None
-        entry_mode = random.choices(ENTRY_MODES, weights=[0.4, 0.3, 0.2, 0.1])[0]
+def generate_phone_number(nationality):
+    """Generate a valid mobile phone number based on nationality."""
+    plan = PHONE_PLANS.get(nationality, PHONE_PLANS['United States'])
+    cc = plan['cc']
+    nsn_length = plan['nsn_length']
+    prefix = random.choice(plan['mobile_prefixes'])
+    remaining_length = nsn_length - len(prefix)
+    digits = ''.join([str(random.randint(0, 9)) for _ in range(remaining_length)])
+    return f'{cc}{prefix}{digits}'
 
-        data.append({
-            'Customer_ID': None,
-            'Customer_Name': name,
-            'Date_of_Birth': dob,
-            'Gender': gender,
-            'Nationality': nationality,
-            'ID_Number': id_number,
-            'ID_Type': id_type,
-            'Email_Address': email,
-            'Phone_Number': phone,
-            'Address_Line1': fake.street_address(),
-            'City': city,
-            'State_Province': state,
-            'Marketing_Consent': marketing_consent,
-            'Travel_Document_Expiry': expiry,
-            'Communication_Preference': comm_pref,
-            'Date_Registered': date_registered,
-            'Blacklist_Flag': blacklist_flag,
-            'Blacklist_Date': blacklist_date,
-            'Customer_Entry_Mode': entry_mode,
-            'Company_Registration_Number': None,
-            'Industry_Sector': None,
-            'Company_Size': None,
-            'Headquarters': None,
-        })
-    return data
+def get_city_province(nationality, faker_instance):
+    """Get city and province for specific countries, fallback to Faker for others."""
+    if nationality in COUNTRY_CITIES_PROVINCES:
+        city_province = random.choice(COUNTRY_CITIES_PROVINCES[nationality])
+        return city_province['city'], city_province['province']
+    else:
+        city = faker_instance.city()
+        try:
+            province = faker_instance.administrative_unit()
+        except AttributeError:
+            try:
+                province = faker_instance.province()
+            except AttributeError:
+                try:
+                    province = faker_instance.state()
+                except AttributeError:
+                    province = "Unknown"
+        return city, province
 
-def generate_company_data(num):
-    sectors = ['Finance', 'IT', 'Manufacturing', 'Healthcare', 'Retail', 'Transportation', 'Consulting']
+class Person:
+    def __init__(self, client_id, is_main_holder=False):
+        """Generate customer information."""
+        # Ensure 60% South Africans
+        self.nationality = random.choices(
+            ['South Africa'] + [c for c in PHONE_PLANS.keys() if c != 'South Africa'],
+            weights=[0.6] + [0.4 / (len(PHONE_PLANS) - 1)] * (len(PHONE_PLANS) - 1)
+        )[0]
+        self.faker = FAKER_INSTANCES[self.nationality]
+        self.client_id = client_id
+        self.is_main_holder = is_main_holder
+
+        # Basic info
+        self.name = self.faker.name()
+        min_age = 18 if is_main_holder else 0
+        self.dob = self.faker.date_of_birth(minimum_age=min_age, maximum_age=80)
+        self.gender = random.choices(['M', 'F', 'Other', 'Prefer not to say'], weights=[0.48, 0.48, 0.02, 0.02])[0]
+
+        # ID details
+        if self.nationality == 'South Africa':
+            self.id_type = random.choices(['National ID', 'Passport', "Driver's License"], weights=[0.6, 0.3, 0.1])[0]
+        else:
+            self.id_type = random.choices(['Passport', "Driver's License"], weights=[0.7, 0.3])[0]
+        self.id_number = generate_id_number(self.nationality, self.id_type, self.dob, self.gender, self.faker)
+        self.travel_document_expiry = self.faker.date_between(start_date=date(TARGET_YEAR, 1, 1), end_date=date(TARGET_YEAR + 10, 12, 31)) if self.id_type == 'Passport' else None
+
+        # Contact details
+        email_domain = random.choice(['gmail.com', 'outlook.com', 'yahoo.com', 'hotmail.com'])
+        email_name = re.sub(r'[^a-zA-Z0-9]', '', self.name.lower().replace(' ', '.'))
+        self.email_address = f'{email_name}@{email_domain}'
+        self.phone_number = generate_phone_number(self.nationality)
+        self.address = self.faker.street_address()
+        
+        # Get city and province
+        self.city, self.province_state = get_city_province(self.nationality, self.faker)
+
+        self.marketing_consent = random.choices(['Yes', 'No'], weights=[0.7, 0.3])[0]
+        self.comm_pref = random.choices(['Email', 'SMS', 'Phone', 'Mail'], weights=[0.4, 0.3, 0.2, 0.1])[0]
+
+        # Registration details
+        self.date_of_registration = self.faker.date_between(start_date=date(TARGET_YEAR, 1, 1), end_date=date(TARGET_YEAR, 12, 31))
+        self.entry_mode = random.choice(ENTRY_MODES)
+
+def generate_clients():
+    """Generate client data with shared client IDs."""
     data = []
-    for _ in tqdm(range(num), desc="Generating Companies"):
-        name = fake.company()
-        hq_country = random.choice(list(PHONE_PLANS.keys()))
-        state, hq_city = get_province_city(hq_country)  # Use get_province_city for consistency
-        headquarters = f"{hq_city}, {hq_country}"
+    client_counter = 1  # Counter for sequential numbering
+    individuals_left = NUM_INDIVIDUALS
 
-        comp_reg_num = COMPANY_REG_FORMATS.get(hq_country, COMPANY_REG_FORMATS['United States'])()
-        industry_sector = random.choice(sectors)
-        company_size = random.choice([10, 50, 200, 500, 1000, 5000])
-        phone = phone_for_country(hq_country)
-        domain_root = clean_domain(name)
-        tld = tld_for_country(hq_country)
-        email = f"info@{domain_root}{tld}"
-        marketing_consent = random.choice([True, False])
-        comm_pref = random.choice(['Email', 'SMS', 'Phone', 'Mail'])
-        date_registered = fake.date_between(start_date=date(1985, 1, 1), end_date=date.today())
-        blacklist_flag = random.random() < 0.01
-        blacklist_date = fake.date_between(start_date=date_registered + timedelta(days=1), end_date=date.today()) if blacklist_flag else None
-        entry_mode = random.choices(['Website', 'Application', 'Agent'], weights=[0.5, 0.3, 0.2])[0]
+    for _ in tqdm(range(NUM_INDIVIDUALS), desc="Generating clients"):
+        group_size = random.choices([1, 2, 3, 4, 5], weights=[0.5, 0.3, 0.15, 0.03, 0.02])[0]
+        group_size = min(group_size, individuals_left)
+        if group_size == 0:
+            break
 
-        data.append({
-            'Customer_ID': None,
-            'Customer_Name': name,
-            'Date_of_Birth': None,
-            'Gender': None,
-            'Nationality': None,
-            'ID_Number': None,
-            'ID_Type': None,
-            'Email_Address': email,
-            'Phone_Number': phone,
-            'Address_Line1': fake.street_address(),
-            'City': hq_city,
-            'State_Province': state,
-            'Marketing_Consent': marketing_consent,
-            'Travel_Document_Expiry': None,
-            'Communication_Preference': comm_pref,
-            'Date_Registered': date_registered,
-            'Blacklist_Flag': blacklist_flag,
-            'Blacklist_Date': blacklist_date,
-            'Customer_Entry_Mode': entry_mode,
-            'Company_Registration_Number': comp_reg_num,
-            'Industry_Sector': industry_sector,
-            'Company_Size': company_size,
-            'Headquarters': headquarters,
-        })
-    return data
+        # Generate client ID in format CL{TARGET_YEAR}0001
+        client_id = f"CL{TARGET_YEAR}{client_counter:04d}"
+        
+        # Main holder (must be over 18)
+        data.append(Person(client_id, is_main_holder=True).__dict__)
+        # Additional members (can be any age)
+        for _ in range(group_size - 1):
+            data.append(Person(client_id, is_main_holder=False).__dict__)
+        
+        client_counter += 1
+        individuals_left -= group_size
 
-# Generate data
-individuals = generate_individual_data(NUM_INDIVIDUALS)
-companies = generate_company_data(NUM_COMPANIES)
+    # Convert to DataFrame
+    df = pd.DataFrame(data)
+    # Drop faker object and reorder columns
+    df = df[['client_id', 'is_main_holder', 'name', 'dob', 'gender', 'nationality', 'id_type', 'id_number',
+             'travel_document_expiry', 'email_address', 'phone_number', 'address', 'city', 'province_state',
+             'marketing_consent', 'comm_pref', 'date_of_registration', 'entry_mode']]
+    return df
 
-# Assign IDs
-for i, customer in enumerate(individuals):
-    customer['Customer_ID'] = f'CUS{i+1:06d}'
-for j, customer in enumerate(companies):
-    customer['Customer_ID'] = f'COM{j+1:06d}'
+# Generate and save data
+os.makedirs('airplane_data', exist_ok=True)
+clients_df = generate_clients()
+clients_df.to_parquet(f'airplane_data/clients_{TARGET_YEAR}.parquet', index=False)
+print(f"Saved {len(clients_df)} records to airplane_data/clients_{TARGET_YEAR}.parquet")
 
-# Combine & save
-all_customers = individuals + companies
-df = pd.DataFrame(all_customers).sort_values('Customer_ID').reset_index(drop=True)
-
-output_folder = 'airline_data'
-os.makedirs(output_folder, exist_ok=True)
-df.to_parquet(f'{output_folder}/customers.parquet', index=False)
-
-print(f"Customer dataset saved to '{output_folder}/customers.parquet'")
-print(f"Total records: {len(df)} (Individuals: {NUM_INDIVIDUALS}, Companies: {NUM_COMPANIES})")
+# Verify South African percentage and National ID restriction
+sa_count = len(clients_df[clients_df['nationality'] == 'South Africa'])
+sa_percentage = (sa_count / len(clients_df)) * 100
+national_id_non_sa = len(clients_df[(clients_df['id_type'] == 'National ID') & (clients_df['nationality'] != 'South Africa')])
+print(f"South African percentage: {sa_percentage:.2f}%")
+print(f"Non-South Africans with National ID: {national_id_non_sa}")
