@@ -108,12 +108,33 @@ def generate_debit_orders(target_year):
     fake_uuids = []
     fake_ibans = []
     fake_companies = []
+    fake_utility_companies = []
+    fake_subscription_services = []
+    fake_insurance_companies = []
+    fake_schools = []
     
     print("Pre-generating fake data...")
     for i in range(num_debit_orders):
         fake_uuids.append(fake.uuid4())
         fake_ibans.append(fake.iban()[:16])
         fake_companies.append(fake.company())
+        fake_utility_companies.append(fake.random_element([
+            "City Power Utility", "Water Works Inc", "Gas & Electric Co",
+            "Municipal Water Board", "Regional Power Grid", "Natural Gas Services"
+        ]))
+        fake_subscription_services.append(fake.random_element([
+            "Netflix", "Spotify", "Amazon Prime", "YouTube Premium",
+            "Microsoft Office 365", "Adobe Creative Cloud", "Gym Membership",
+            "Newspaper Subscription", "Magazine Club"
+        ]))
+        fake_insurance_companies.append(fake.random_element([
+            "Allstate Insurance", "State Farm", "Geico", "Progressive",
+            "Liberty Mutual", "Nationwide", "Aetna Health", "Blue Cross"
+        ]))
+        fake_schools.append(fake.random_element([
+            "City University", "Technical College", "Private Academy",
+            "Community College", "Vocational School", "Language Institute"
+        ]))
         
         # Generate start dates - fix date range issue
         account = sampled_accounts.iloc[i]
@@ -242,15 +263,57 @@ def generate_debit_orders(target_year):
             if has_default and pd.notna(default_date) and debit_type in ["Loan Repayment", "Business Loan Repayment"]:
                 end_date = max(end_date, pd.to_datetime(default_date).date())
 
-        # Internal vs External using pre-generated random
-        if internal_external_randoms[i] < 0.65:
+        # Calculate cancellation date - only if status is Cancelled and there's an end date
+        cancellation_date = None
+        if status == "Cancelled" and end_date:
+            # Cancellation date should be after start date but before/on end date
+            cancellation_date = fake.date_between_dates(
+                date_start=start_date,
+                date_end=end_date
+            )
+
+        # Internal vs External logic with proper descriptions
+        external_required_types = [
+            "Utility Bill", "Subscription", "Insurance Premium", 
+            "School Fees", "Membership Fee", "Donation", "Supplier Payment",
+            "Office Lease", "Software Subscription"
+        ]
+        
+        internal_allowed_types = [
+            "Salary Payment", "Payroll", "Loan Repayment", 
+            "Business Loan Repayment", "Mortgage", "Credit Card Payment",
+            "Corporate Credit Card Payment"
+        ]
+
+        if debit_type in external_required_types:
+            # Force external for these types (payments to companies)
+            account_to = fake_ibans[i]
+            if debit_type == "Utility Bill":
+                description = f"{fake_utility_companies[i]} - Utility Payment"
+            elif debit_type in ["Subscription", "Software Subscription"]:
+                description = f"{fake_subscription_services[i]} - Subscription"
+            elif debit_type == "Insurance Premium":
+                description = f"{fake_insurance_companies[i]} - Insurance Premium"
+            elif debit_type == "School Fees":
+                description = f"{fake_schools[i]} - Tuition Fees"
+            elif debit_type == "Supplier Payment":
+                description = f"{fake_companies[i]} - Supplier Invoice"
+            elif debit_type == "Office Lease":
+                description = f"{fake_companies[i]} - Office Rent"
+            else:
+                description = fake_companies[i]
+                
+        elif debit_type in internal_allowed_types and internal_external_randoms[i] < 0.65:
+            # Internal transfer for allowed types
             target_account = target_accounts.iloc[i]
             # Ensure it's not the same account
             while target_account["account_id"] == account_id:
                 target_account = accounts_df.sample(1, random_state=seed_int + i).iloc[0]
             account_to = target_account["account_id"]
             description = f"Transfer to {target_account['account_type']} - {target_account['customer_id']}"
+            
         else:
+            # External payment for other types or when random choice favors external
             account_to = fake_ibans[i]
             description = fake_companies[i]
 
@@ -264,6 +327,7 @@ def generate_debit_orders(target_year):
             "start_date": start_date,
             "end_date": end_date,
             "status": status,
+            "cancellation_date": cancellation_date,
             "account_to": account_to,
             "description": description
         })
@@ -285,6 +349,6 @@ def generate_debit_orders(target_year):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Generate debit order data for a specific year")
-    parser.add_argument('--year', type=int, default=2019, help='Year for debit order data generation (must be >= 2018)')
+    parser.add_argument('--year', type=int, default=2024, help='Year for debit order data generation (must be >= 2018)')
     args = parser.parse_args()
     generate_debit_orders(args.year)
