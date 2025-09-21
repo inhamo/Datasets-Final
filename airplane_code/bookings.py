@@ -3,10 +3,10 @@ import numpy as np
 from datetime import datetime, timedelta
 import random
 from typing import Dict, List, Tuple, Optional
-import uuid
 import os
 import warnings
 from tqdm import tqdm
+from scipy import stats
 
 warnings.filterwarnings('ignore')
 BASE_YEAR = 2021
@@ -21,7 +21,6 @@ class FastAirlineBookingsGenerator:
         """
         self.TARGET_YEAR = target_year
         
-        # Load data dynamically based on target year
         try:
             self.flight_schedule_df = pd.read_parquet(f'airplane_data/flight_schedule_{target_year}.parquet')
             
@@ -35,9 +34,8 @@ class FastAirlineBookingsGenerator:
                 self.clients_df = pd.concat(client_files, ignore_index=True)
                 self.clients_df = self.clients_df.drop_duplicates(subset=['client_id'], keep='last')
             else:
-                raise FileNotFoundError(f"No plane data files found from {BASE_YEAR} to {target_year}")
+                raise FileNotFoundError(f"No client data files found from {BASE_YEAR} to {target_year}")
             
-            # For planes: combine from BASE_YEAR to target_year
             planes_files = []
             for year in range(BASE_YEAR, target_year + 1):
                 file_path = f'airplane_data/planes_{year}.parquet'
@@ -50,7 +48,6 @@ class FastAirlineBookingsGenerator:
             else:
                 raise FileNotFoundError(f"No plane data files found from {BASE_YEAR} to {target_year}")
             
-            # For routes: combine from BASE_YEAR to target_year
             routes_files = []
             for year in range(BASE_YEAR, target_year + 1):
                 file_path = f'airplane_data/routes_{year}.parquet'
@@ -68,15 +65,11 @@ class FastAirlineBookingsGenerator:
         except Exception as e:
             raise Exception(f"Error loading data: {str(e)}")
                 
-        # Prepare data
         self._prepare_data()
-        
-        # Pre-generate random values for speed
         self._pregenerate_random_values()
 
     def _prepare_data(self):
-        """Prepare and merge all datasets."""
-        # Convert date columns
+        """Prepare and merge all datasets with robust datetime handling."""
         self.flight_schedule_df['scheduled_departure'] = pd.to_datetime(self.flight_schedule_df['scheduled_departure'])
         self.flight_schedule_df['scheduled_arrival'] = pd.to_datetime(self.flight_schedule_df['scheduled_arrival'])
         
@@ -85,13 +78,17 @@ class FastAirlineBookingsGenerator:
         if 'actual_arrival' in self.flight_schedule_df.columns:
             self.flight_schedule_df['actual_arrival'] = pd.to_datetime(self.flight_schedule_df['actual_arrival'])
             
-        self.clients_df['dob'] = pd.to_datetime(self.clients_df['dob'])
-        self.clients_df['date_of_registration'] = pd.to_datetime(self.clients_df['date_of_registration'])
+        self.clients_df['dob'] = pd.to_datetime(self.clients_df['dob'], errors='coerce')
+        self.clients_df['date_of_registration'] = pd.to_datetime(
+            self.clients_df['date_of_registration'], errors='coerce', format='mixed'
+        )
+        invalid_dates = self.clients_df['date_of_registration'].isna()
+        if invalid_dates.any():
+            print(f"Warning: {invalid_dates.sum()} invalid registration dates found. Replacing with {self.TARGET_YEAR}-01-01")
+            self.clients_df.loc[invalid_dates, 'date_of_registration'] = pd.to_datetime(f"{self.TARGET_YEAR}-01-01")
         
-        # Filter only main account holders for booking
-        self.main_holders = self.clients_df[self.clients_df['is_main_holder'] == True].copy()
+        self.main_holders = self.clients_df[self.clients_df['is_main_holder'] == True][['client_id', 'city', 'date_of_registration']].copy()
         
-        # Merge flight schedule with routes and planes
         self.flight_data = self.flight_schedule_df.merge(
             self.routes_df, on='route_id', how='left'
         ).merge(
@@ -100,20 +97,13 @@ class FastAirlineBookingsGenerator:
             how='left'
         )
         
-        # Filter flights for target year only
         self.flight_data = self.flight_data[
             self.flight_data['scheduled_departure'].dt.year == self.TARGET_YEAR
         ].copy()
         
-        # Rename aircraft_model to aircraft_type for consistency
-        self.flight_data['aircraft_type'] = self.flight_data['aircraft_model']
-        
-        # Fill missing aircraft types or capacities with default
-        self.flight_data['aircraft_type'] = self.flight_data['aircraft_type'].fillna('default')
-        self.flight_data['aircraft_capacity'] = self.flight_data['capacity'].fillna(150)
-        
-        # Drop the temporary capacity column from planes_df
-        self.flight_data = self.flight_data.drop(columns=['capacity'], errors='ignore')
+        self.flight_data['aircraft_type'] = self.flight_data['aircraft_model'].fillna('default')
+        self.flight_data['aircraft_capacity'] = self.flight_data['capacity'].fillna(150).astype(int)
+        self.flight_data = self.flight_data.drop(columns=['capacity', 'aircraft_model'], errors='ignore')
         
         print(f"Loaded data for {self.TARGET_YEAR}:")
         print(f"- {len(self.main_holders):,} main account holders")
@@ -121,239 +111,213 @@ class FastAirlineBookingsGenerator:
         print(f"- {self.flight_data['route_id'].nunique()} unique routes")
 
     def _pregenerate_random_values(self):
-        """Pre-generate random values for speed optimization."""
+        """Pre-generate random values using various statistical distributions."""
         num_flights = len(self.flight_data)
+        self.num_samples = num_flights * 5
         
-        # Pre-generate load factors (50% to 115%)
-        self.load_factors = np.random.uniform(0.50, 1.15, num_flights)
+        self.load_factors = stats.beta.rvs(a=5, b=2, loc=0.5, scale=0.65, size=num_flights)
         
-        # Pre-generate passenger compositions (vectorized)
-        passenger_probs = [0.65, 0.20, 0.06, 0.04, 0.02, 0.02, 0.01]  # Probabilities for different family sizes
-        passenger_types = [
-            (1, 0, 0), (2, 0, 0), (2, 1, 0), (2, 2, 0), 
-            (2, 1, 1), (3, 0, 0), (2, 3, 0)
-        ]
+        passenger_probs = [0.65, 0.20, 0.06, 0.04, 0.02, 0.02, 0.01]
+        passenger_types = [(1, 0, 0), (2, 0, 0), (2, 1, 0), (2, 2, 0), (2, 1, 1), (3, 0, 0), (2, 3, 0)]
+        choices = np.random.choice(len(passenger_types), size=self.num_samples, p=passenger_probs)
+        self.random_passenger_types = np.array([passenger_types[i] for i in choices])
         
-        # Pre-generate random choices for efficiency
-        self.random_passenger_choices = np.random.choice(
-            len(passenger_types), size=num_flights * 5, p=passenger_probs
-        )
-        self.random_passenger_types = [passenger_types[i] for i in self.random_passenger_choices]
-        
-        # Pre-generate other random values
-        self.random_booking_classes = np.random.choice(
-            ['economy', 'business'], size=num_flights * 5, p=[0.95, 0.05]
-        )
-        self.random_trip_types = np.random.choice(
-            ['one-way', 'return'], size=num_flights * 5, p=[0.25, 0.75]
-        )
-        self.random_status_choices = np.random.choice(
-            ['confirmed', 'cancelled', 'rescheduled', 'on-hold'], 
-            size=num_flights * 5, p=[0.87, 0.08, 0.04, 0.01]
+        self.random_booking_classes = np.where(
+            stats.binom.rvs(n=1, p=0.05, size=self.num_samples) == 1, 'business', 'economy'
         )
         
-        # Pre-generate booking timing offsets (in hours)
-        self.booking_offsets = np.random.exponential(scale=168, size=num_flights * 5)  # ~1 week average
+        self.random_trip_types = np.where(
+            stats.binom.rvs(n=1, p=0.75, size=self.num_samples) == 1, 'return', 'one-way'
+        )
         
-        # Pre-generate pricing multipliers
-        self.price_multipliers = np.random.uniform(0.8, 1.8, num_flights * 5)
+        status_probs = [0.87, 0.08, 0.04, 0.01]
+        status_choices = ['confirmed', 'cancelled', 'rescheduled', 'on-hold']
+        self.random_status_choices = np.random.choice(status_choices, size=self.num_samples, p=status_probs)
         
-        # Pre-generate addon service flags
+        self.booking_offsets = stats.expon.rvs(scale=168, size=self.num_samples)
+        
+        self.price_multipliers = stats.norm.rvs(loc=1.3, scale=0.25, size=self.num_samples)
+        self.price_multipliers = np.clip(self.price_multipliers, 0.8, 1.8)
+        
         self.addon_flags = {
-            'is_priority': np.random.random(num_flights * 5) < 0.18,
-            'is_assisted': np.random.random(num_flights * 5) < 0.025,
-            'is_special_needs': np.random.random(num_flights * 5) < 0.015,
-            'is_lounge_access': np.random.random(num_flights * 5) < 0.08,
-            'is_cancellation_refundable': np.random.random(num_flights * 5) < 0.45,
-            'is_travel_protection': np.random.random(num_flights * 5) < 0.28,
-            'is_cheap_hotel_accommodation': np.random.random(num_flights * 5) < 0.06,
-            'is_car_rental': np.random.random(num_flights * 5) < 0.05
+            'is_priority': stats.binom.rvs(n=1, p=0.18, size=self.num_samples).astype(bool),
+            'is_assisted': stats.binom.rvs(n=1, p=0.025, size=self.num_samples).astype(bool),
+            'is_special_needs': stats.binom.rvs(n=1, p=0.015, size=self.num_samples).astype(bool),
+            'is_lounge_access': stats.binom.rvs(n=1, p=0.08, size=self.num_samples).astype(bool),
+            'is_cancellation_refundable': stats.binom.rvs(n=1, p=0.45, size=self.num_samples).astype(bool),
+            'is_travel_protection': stats.binom.rvs(n=1, p=0.28, size=self.num_samples).astype(bool),
+            'is_cheap_hotel_accommodation': stats.binom.rvs(n=1, p=0.06, size=self.num_samples).astype(bool),
+            'is_car_rental': stats.binom.rvs(n=1, p=0.05, size=self.num_samples).astype(bool)
         }
 
-    def _simple_seat_assignment(self, aircraft_type):
-        """Simple seat assignment without checking conflicts for speed."""
-        # Default seat configuration
+    def _simple_seat_assignment(self, num_seats):
+        """Vectorized seat assignment."""
         max_row = 30
         seat_letters = ['A', 'B', 'C', 'D', 'E', 'F']
-        
-        row = np.random.randint(1, max_row + 1)
-        seat_letter = np.random.choice(seat_letters)
-        return f"{row}{seat_letter}"
+        rows = np.random.poisson(lam=15, size=num_seats) % max_row + 1
+        letters = np.random.choice(seat_letters, size=num_seats)
+        return [f"{r}{l}" for r, l in zip(rows, letters)]
 
-    def _find_return_flight_fast(self, outbound_flight):
-        """Fast return flight finding with simplified logic."""
-        # Look for return flights within 1-7 days
-        return_start = outbound_flight['scheduled_departure'] + timedelta(days=1)
-        return_end = outbound_flight['scheduled_departure'] + timedelta(days=7)
+    def _find_return_flights(self, flight_data, bookings_df):
+        """Optimized return flight assignment."""
+        return_bookings = bookings_df[bookings_df['trip_type'] == 'return'].copy()
+        if return_bookings.empty:
+            return bookings_df
         
-        # Filter potential return flights
-        return_candidates = self.flight_data[
-            (self.flight_data['origin_city'] == outbound_flight['destination_city']) &
-            (self.flight_data['destination_city'] == outbound_flight['origin_city']) &
-            (self.flight_data['scheduled_departure'] >= return_start) &
-            (self.flight_data['scheduled_departure'] <= return_end)
-        ]
+        return_flights = []
+        max_booking_id = int(bookings_df['booking_id'].str[6:].max()) if not bookings_df.empty else 0
         
-        if len(return_candidates) == 0:
-            return None
+        for idx, booking in return_bookings.iterrows():
+            return_start = booking['scheduled_departure'] + timedelta(days=1)
+            return_end = booking['scheduled_departure'] + timedelta(days=7)
             
-        # Just pick a random return flight for speed
-        return return_candidates.sample(n=1).iloc[0]
+            candidates = flight_data[
+                (flight_data['origin_city'] == booking['destination_city']) &
+                (flight_data['destination_city'] == booking['origin_city']) &
+                (flight_data['scheduled_departure'] >= return_start) &
+                (flight_data['scheduled_departure'] <= return_end)
+            ]
+            
+            if not candidates.empty:
+                geom_idx = min(stats.geom.rvs(p=0.3, size=1)[0] - 1, len(candidates) - 1)
+                return_flight = candidates.iloc[geom_idx]
+                
+                return_booking = booking.copy()
+                max_booking_id += 1
+                return_booking['booking_id'] = f"BK{self.TARGET_YEAR}{max_booking_id:06d}"
+                return_booking['planning_id'] = return_flight['planning_id']
+                return_booking['outbound_id'] = booking['booking_id']
+                return_booking['price_per_ticket'] = round(booking['price_per_ticket'] * np.random.uniform(0.9, 1.1), 2)
+                return_booking['seat_request'] = self._simple_seat_assignment(1)[0]
+                return_flights.append(return_booking)
+        
+        if return_flights:
+            return_df = pd.DataFrame(return_flights)
+            bookings_df = pd.concat([bookings_df, return_df], ignore_index=True)
+        
+        return bookings_df
+
+    def _introduce_data_errors(self, bookings_df: pd.DataFrame) -> pd.DataFrame:
+        """Introduce deliberate errors into the bookings DataFrame."""
+        bookings_with_errors = bookings_df.copy()
+        
+        num_duplicates = int(len(bookings_df) * 0.02)
+        duplicate_rows = bookings_df.sample(n=num_duplicates, replace=True).copy()
+        max_booking_id = int(bookings_df['booking_id'].str[6:].max()) if not bookings_df.empty else 0
+        duplicate_rows['booking_id'] = [
+            f"BK{self.TARGET_YEAR}{i:06d}" 
+            for i in range(max_booking_id + 1, max_booking_id + num_duplicates + 1)
+        ]
+        bookings_with_errors = pd.concat([bookings_with_errors, duplicate_rows], ignore_index=True)
+        
+        for column in ['seat_request', 'price_per_ticket']:
+            mask = stats.binom.rvs(n=1, p=0.01, size=len(bookings_with_errors)).astype(bool)
+            bookings_with_errors.loc[mask, column] = np.nan
+        
+        mask = stats.binom.rvs(n=1, p=0.005, size=len(bookings_with_errors)).astype(bool)
+        bookings_with_errors.loc[mask, 'booking_status'] = 'invalid_status'
+        
+        mask = stats.binom.rvs(n=1, p=0.002, size=len(bookings_with_errors)).astype(bool)
+        bookings_with_errors.loc[mask, 'price_per_ticket'] = -bookings_with_errors.loc[mask, 'price_per_ticket']
+        
+        print(f"Introduced errors:")
+        print(f"- {num_duplicates} duplicate bookings")
+        print(f"- {int(mask.sum())} rows with invalid status")
+        print(f"- Missing values and negative prices added to ~1% and ~0.2% of rows respectively")
+        
+        return bookings_with_errors
 
     def generate_bookings(self):
-        """Generate bookings with very fast processing and random load factors."""
-        print(f"Generating bookings for {self.TARGET_YEAR} with random load factors (50%-115%)")
+        """Generate bookings with vectorized operations."""
+        print(f"Generating bookings for {self.TARGET_YEAR} with varied statistical distributions")
+        
+        flight_data = self.flight_data.copy()
+        flight_data['target_bookings'] = (flight_data['aircraft_capacity'] * 
+                                        self.load_factors[:len(flight_data)] * 
+                                        np.where(self.load_factors[:len(flight_data)] > 0.9, 1.05, 1.0)).astype(int)
+        
+        customer_indices = np.random.randint(0, len(self.main_holders), size=self.num_samples)
+        customer_ids = self.main_holders['client_id'].values[customer_indices]
+        registration_dates = pd.to_datetime(self.main_holders['date_of_registration']).values[customer_indices]
+        
+        invalid_dates = np.isnan(registration_dates.astype(float))
+        if invalid_dates.any():
+            print(f"Warning: {invalid_dates.sum()} invalid registration dates found. Replacing with {self.TARGET_YEAR}-01-01")
+            registration_dates[invalid_dates] = pd.to_datetime(f"{self.TARGET_YEAR}-01-01").to_pydatetime()
         
         bookings = []
         booking_counter = 1
-        random_idx = 0
+        idx = 0
         
-        # Convert main_holders to numpy arrays for faster access
-        customer_ids = self.main_holders['client_id'].values
-        customer_cities = self.main_holders['city'].values
-        
-        # Use tqdm for progress bar
-        for flight_idx, flight in tqdm(self.flight_data.iterrows(), total=len(self.flight_data), desc="Processing flights"):
-            planning_id = flight['planning_id']
-            aircraft_capacity = int(flight['aircraft_capacity'])
-            aircraft_type = flight['aircraft_type']
-            base_price = flight.get('final_price_zar', 800)
-            
-            # Use pre-generated random load factor
-            target_load_factor = self.load_factors[flight_idx % len(self.load_factors)]
-            
-            # Calculate target bookings with simple overbooking
-            overbooking_factor = 1.05 if target_load_factor > 0.9 else 1.0
-            target_bookings = int(aircraft_capacity * target_load_factor * overbooking_factor)
-            
-            # Generate bookings for this flight
+        for _, flight in tqdm(flight_data.iterrows(), total=len(flight_data), desc="Processing flights"):
+            target_bookings = flight['target_bookings']
             current_bookings = 0
             
-            while current_bookings < target_bookings:
-                # Fast customer selection
-                customer_idx = np.random.randint(0, len(customer_ids))
-                customer_id = customer_ids[customer_idx]
-                customer_city = customer_cities[customer_idx]
-                
-                # Use pre-generated passenger composition
-                if random_idx >= len(self.random_passenger_types):
-                    random_idx = 0
-                    
-                num_adults, num_children, num_infants = self.random_passenger_types[random_idx]
+            while current_bookings < target_bookings and idx < self.num_samples:
+                num_adults, num_children, num_infants = self.random_passenger_types[idx]
                 total_passengers = num_adults + num_children
                 
-                # Check if we can fit these passengers
                 if current_bookings + total_passengers > target_bookings:
                     break
                 
-                # Use pre-generated values
-                booking_class = self.random_booking_classes[random_idx % len(self.random_booking_classes)]
-                trip_type = self.random_trip_types[random_idx % len(self.random_trip_types)]
-                status = self.random_status_choices[random_idx % len(self.random_status_choices)]
-                
-                # Simple booking date calculation
-                hours_before = min(self.booking_offsets[random_idx % len(self.booking_offsets)], 2160)  # Max 90 days
+                hours_before = min(self.booking_offsets[idx], 2160)
                 booking_date = flight['scheduled_departure'] - timedelta(hours=hours_before)
+                reg_date = pd.Timestamp(registration_dates[idx])
+                if booking_date < reg_date:
+                    offset_hours = stats.expon.rvs(scale=168)
+                    booking_date = reg_date + timedelta(hours=offset_hours)
                 
-                # Simple pricing
-                price_multiplier = self.price_multipliers[random_idx % len(self.price_multipliers)]
-                price_per_ticket = base_price * price_multiplier
-                
-                if booking_class == 'business':
+                price_per_ticket = flight.get('final_price_zar', 800) * self.price_multipliers[idx]
+                if self.random_booking_classes[idx] == 'business':
                     price_per_ticket *= 3.0
                 
-                # Simple seat assignment
-                seat_request = self._simple_seat_assignment(aircraft_type)
+                status = self.random_status_choices[idx]
+                cancelled_date = (booking_date + timedelta(hours=stats.uniform.rvs(loc=1, scale=239))) if status == 'cancelled' else None
+                on_hold_date = (booking_date + timedelta(hours=stats.uniform.rvs(loc=1, scale=47))) if status == 'on-hold' else None
+                on_hold_end_date = (on_hold_date + timedelta(days=365)) if status == 'on-hold' else None
                 
-                # Status-related dates (simplified)
-                cancelled_date = None
-                rescheduled_date = None
-                on_hold_date = None
-                on_hold_end_date = None
-                
-                if status == 'cancelled':
-                    cancelled_date = booking_date + timedelta(hours=np.random.uniform(1, 240))
-                elif status == 'on-hold':
-                    on_hold_date = booking_date + timedelta(hours=np.random.uniform(1, 48))
-                    on_hold_end_date = on_hold_date + timedelta(days=365)
-                
-                # Create outbound booking
                 booking = {
                     'booking_id': f"BK{self.TARGET_YEAR}{booking_counter:06d}",
-                    'customer_id': customer_id,
-                    'planning_id': planning_id,
+                    'customer_id': customer_ids[idx],
+                    'planning_id': flight['planning_id'],
                     'booking_date': booking_date,
-                    'trip_type': trip_type,
+                    'trip_type': self.random_trip_types[idx],
                     'num_adults': num_adults,
                     'num_children': num_children,
                     'num_infants': num_infants,
-                    'booking_class': booking_class,
+                    'booking_class': self.random_booking_classes[idx],
                     'booking_status': status,
                     'cancelled_date': cancelled_date,
-                    'rescheduled_date': rescheduled_date,
+                    'rescheduled_date': None,
                     'on_hold_date': on_hold_date,
                     'on_hold_end_date': on_hold_end_date,
                     'outbound_id': None,
                     'rescheduled_id': None,
-                    'seat_request': seat_request,
+                    'seat_request': self._simple_seat_assignment(1)[0],
                     'price_per_ticket': round(price_per_ticket, 2),
-                    'is_priority': self.addon_flags['is_priority'][random_idx % len(self.addon_flags['is_priority'])],
-                    'is_assisted': self.addon_flags['is_assisted'][random_idx % len(self.addon_flags['is_assisted'])],
-                    'is_special_needs': self.addon_flags['is_special_needs'][random_idx % len(self.addon_flags['is_special_needs'])],
-                    'is_lounge_access': self.addon_flags['is_lounge_access'][random_idx % len(self.addon_flags['is_lounge_access'])],
-                    'is_cancellation_refundable': self.addon_flags['is_cancellation_refundable'][random_idx % len(self.addon_flags['is_cancellation_refundable'])],
-                    'is_travel_protection': self.addon_flags['is_travel_protection'][random_idx % len(self.addon_flags['is_travel_protection'])],
-                    'is_cheap_hotel_accommodation': self.addon_flags['is_cheap_hotel_accommodation'][random_idx % len(self.addon_flags['is_cheap_hotel_accommodation'])],
-                    'is_car_rental': self.addon_flags['is_car_rental'][random_idx % len(self.addon_flags['is_car_rental'])]
+                    'is_priority': self.addon_flags['is_priority'][idx],
+                    'is_assisted': self.addon_flags['is_assisted'][idx],
+                    'is_special_needs': self.addon_flags['is_special_needs'][idx],
+                    'is_lounge_access': self.addon_flags['is_lounge_access'][idx],
+                    'is_cancellation_refundable': self.addon_flags['is_cancellation_refundable'][idx],
+                    'is_travel_protection': self.addon_flags['is_travel_protection'][idx],
+                    'is_cheap_hotel_accommodation': self.addon_flags['is_cheap_hotel_accommodation'][idx],
+                    'is_car_rental': self.addon_flags['is_car_rental'][idx],
+                    'scheduled_departure': flight['scheduled_departure'],
+                    'origin_city': flight['origin_city'],
+                    'destination_city': flight['destination_city']
                 }
                 
                 bookings.append(booking)
                 current_bookings += total_passengers
                 booking_counter += 1
-                
-                # Handle return flight
-                if trip_type == 'return':
-                    return_flight = self._find_return_flight_fast(flight)
-                    
-                    if return_flight is not None:
-                        return_price = price_per_ticket * np.random.uniform(0.9, 1.1)
-                        return_seat = self._simple_seat_assignment(return_flight['aircraft_type'])
-                        
-                        return_booking = {
-                            'booking_id': f"BK{self.TARGET_YEAR}{booking_counter:06d}",
-                            'customer_id': customer_id,
-                            'planning_id': return_flight['planning_id'],
-                            'booking_date': booking_date,
-                            'trip_type': 'return',
-                            'num_adults': num_adults,
-                            'num_children': num_children,
-                            'num_infants': num_infants,
-                            'booking_class': booking_class,
-                            'booking_status': status,
-                            'cancelled_date': cancelled_date,
-                            'rescheduled_date': rescheduled_date,
-                            'on_hold_date': on_hold_date,
-                            'on_hold_end_date': on_hold_end_date,
-                            'outbound_id': booking['booking_id'],
-                            'rescheduled_id': None,
-                            'seat_request': return_seat,
-                            'price_per_ticket': round(return_price, 2),
-                            'is_priority': booking['is_priority'],
-                            'is_assisted': booking['is_assisted'],
-                            'is_special_needs': booking['is_special_needs'],
-                            'is_lounge_access': booking['is_lounge_access'],
-                            'is_cancellation_refundable': booking['is_cancellation_refundable'],
-                            'is_travel_protection': booking['is_travel_protection'],
-                            'is_cheap_hotel_accommodation': booking['is_cheap_hotel_accommodation'],
-                            'is_car_rental': booking['is_car_rental']
-                        }
-                        
-                        bookings.append(return_booking)
-                        booking_counter += 1
-                
-                random_idx += 1
-                
+                idx += 1
+        
         bookings_df = pd.DataFrame(bookings)
+        bookings_df = self._find_return_flights(flight_data, bookings_df)
+        bookings_df = self._introduce_data_errors(bookings_df)
+        
+        bookings_df = bookings_df.drop(columns=['scheduled_departure', 'origin_city', 'destination_city'], errors='ignore')
         
         print(f"\n=== FAST BOOKING GENERATION COMPLETE ===")
         print(f"Total bookings generated: {len(bookings_df):,}")
@@ -370,29 +334,31 @@ class FastAirlineBookingsGenerator:
         if filename is None:
             filename = f'airplane_data/bookings_{self.TARGET_YEAR}.parquet'
             
-        bookings_df.to_parquet(filename, index=False)
+        bookings_df.to_parquet(filename, index=False, engine='pyarrow')
         print(f"Bookings saved to: {filename}")
         
         return filename
 
 def generate_fast_airline_bookings(target_year=BASE_YEAR, save_file=True):
     """
-    Main function to generate airline bookings super fast with random load factors.
+    Main function to generate airline bookings with optimized performance.
     
     Args:
         target_year (int): Year to generate bookings for (default: BASE_YEAR)
         save_file (bool): Whether to save the results to parquet (default: True)
         
     Returns:
-        pd.DataFrame: Generated bookings dataset
+        pd.DataFrame: Generated bookings dataset with introduced errors
     """
     print(f"Starting FAST airline bookings generation for {target_year}")
-    print("Using random load factors between 50% and 115%")
+    print("Using various statistical distributions (beta, normal, binomial, etc.)")
     print("Optimizations:")
-    print("- Pre-generated random values")
-    print("- Simplified seat assignment")
-    print("- Fast return flight lookup")
-    print("- Vectorized operations")
+    print("- Vectorized booking generation")
+    print("- Simplified seat assignment with Poisson distribution")
+    print("- Optimized return flight lookup")
+    print("- Robust datetime handling")
+    print("- Booking date validation against registration date")
+    print("- Introduced data errors (duplicates, missing values, invalid data)")
     print("-" * 70)
     
     try:
