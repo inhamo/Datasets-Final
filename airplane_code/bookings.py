@@ -79,7 +79,7 @@ class RealisticAirlineBookingsGenerator:
             
         self.clients_df['dob'] = pd.to_datetime(self.clients_df['dob'], errors='coerce')
         
-        # More robust registration date handling
+        # More robust registration date handling - ensure all dates are in target year
         self.clients_df['date_of_registration'] = pd.to_datetime(
             self.clients_df['date_of_registration'], errors='coerce', format='mixed'
         )
@@ -87,23 +87,38 @@ class RealisticAirlineBookingsGenerator:
         # Handle invalid registration dates more realistically
         invalid_dates_mask = self.clients_df['date_of_registration'].isna()
         
-        # Get the earliest flight date for the target year to set realistic bounds
+        # Get date ranges for realistic registration dates
         target_year_start = pd.to_datetime(f"{self.TARGET_YEAR}-01-01")
+        target_year_end = pd.to_datetime(f"{self.TARGET_YEAR}-12-31")
         earliest_flight = self.flight_schedule_df['scheduled_departure'].min()
         
+        # CRITICAL FIX: Ensure registration dates are within the target year
         if invalid_dates_mask.any():
             print(f"Warning: {invalid_dates_mask.sum()} invalid registration dates found. Generating realistic dates...")
             
-            # Generate realistic registration dates between 6 months before target year and earliest flight
-            reg_start = target_year_start - timedelta(days=180)  # 6 months before target year
-            reg_end = min(earliest_flight - timedelta(days=1), target_year_start + timedelta(days=30))  # Before earliest flight or early in target year
+            # Generate realistic registration dates within the target year
+            reg_start = target_year_start
+            reg_end = min(earliest_flight - timedelta(days=1), target_year_end)
             
-            # Generate random dates in this range
+            if reg_start >= reg_end:
+                # Fallback: use first 6 months of target year
+                reg_end = target_year_start + timedelta(days=180)
+            
             date_range = (reg_end - reg_start).days
-            random_days = np.random.randint(0, max(1, date_range), size=invalid_dates_mask.sum())
-            random_dates = [reg_start + timedelta(days=int(days)) for days in random_days]
-            
-            self.clients_df.loc[invalid_dates_mask, 'date_of_registration'] = random_dates
+            if date_range > 0:
+                random_days = np.random.randint(0, max(1, date_range), size=invalid_dates_mask.sum())
+                random_dates = [reg_start + timedelta(days=int(days)) for days in random_days]
+                self.clients_df.loc[invalid_dates_mask, 'date_of_registration'] = random_dates
+        
+        # CRITICAL FIX: Ensure no registration dates are after the target year
+        future_registrations = self.clients_df['date_of_registration'] > target_year_end
+        if future_registrations.any():
+            print(f"Adjusting {future_registrations.sum()} registration dates from after {self.TARGET_YEAR}...")
+            # Move these to random dates within the target year
+            days_in_year = (target_year_end - target_year_start).days
+            random_days = np.random.randint(0, days_in_year, size=future_registrations.sum())
+            adjusted_dates = [target_year_start + timedelta(days=int(days)) for days in random_days]
+            self.clients_df.loc[future_registrations, 'date_of_registration'] = adjusted_dates
         
         # Ensure all registration dates are before the target year's flights
         late_registration_mask = self.clients_df['date_of_registration'] >= earliest_flight
@@ -145,6 +160,7 @@ class RealisticAirlineBookingsGenerator:
         print(f"- {len(self.flight_data):,} scheduled flights")
         print(f"- {self.flight_data['route_id'].nunique()} unique routes")
         print(f"- Registration dates range: {self.main_holders['date_of_registration'].min()} to {self.main_holders['date_of_registration'].max()}")
+        print(f"- Flight dates range: {self.flight_data['scheduled_departure'].min()} to {self.flight_data['scheduled_departure'].max()}")
 
     def _calculate_route_popularity(self):
         """Calculate route popularity based on city pairs and add time-of-day factors."""
@@ -214,6 +230,10 @@ class RealisticAirlineBookingsGenerator:
         Returns:
             DataFrame of customers available for booking at that date
         """
+        # Ensure booking_date is timezone-naive if registration dates are timezone-naive
+        if hasattr(booking_date, 'tz') and booking_date.tz is not None:
+            booking_date = booking_date.tz_localize(None)
+        
         available_customers = self.main_holders[
             self.main_holders['date_of_registration'] <= booking_date
         ].copy()
@@ -222,6 +242,9 @@ class RealisticAirlineBookingsGenerator:
 
     def _generate_booking_date(self, flight_departure, popularity_factor=1.0):
         """Generate realistic booking date based on flight departure and popularity."""
+        # Ensure booking dates don't go before the target year
+        target_year_start = pd.to_datetime(f"{self.TARGET_YEAR}-01-01")
+        
         # Popular flights get booked earlier on average
         if popularity_factor > 0.8:
             # High popularity: book 2-12 weeks in advance (peak at 4 weeks)
@@ -243,6 +266,16 @@ class RealisticAirlineBookingsGenerator:
         hours_before = max(hours_before, 2)
         
         booking_date = flight_departure - timedelta(hours=hours_before)
+        
+        # CRITICAL FIX: Don't allow booking dates before the target year
+        if booking_date < target_year_start:
+            # If booking would be before target year, adjust to be within target year
+            days_into_year = min((flight_departure - target_year_start).days, 30)
+            if days_into_year > 0:
+                booking_date = target_year_start + timedelta(days=np.random.randint(0, days_into_year))
+            else:
+                # If flight is very early in the year, book just 1-7 days before
+                booking_date = flight_departure - timedelta(days=np.random.randint(1, 8))
         
         return booking_date
 
@@ -424,15 +457,14 @@ class RealisticAirlineBookingsGenerator:
                 available_customers = self._get_available_customers_at_date(booking_date)
                 
                 if available_customers.empty:
-                    # No customers available yet, try a later booking date
-                    booking_date = self._generate_booking_date(
-                        flight['scheduled_departure'], 
-                        flight['overall_popularity'] * 0.8  # Less popular timing
-                    )
+                    # If no customers available, try a booking date closer to flight departure
+                    # This ensures we use customers who registered later
+                    hours_before = np.random.randint(24, 168)  # 1-7 days before
+                    booking_date = flight['scheduled_departure'] - timedelta(hours=hours_before)
                     available_customers = self._get_available_customers_at_date(booking_date)
                     
                     if available_customers.empty:
-                        break  # Still no customers, skip this attempt
+                        continue  # Skip this attempt if still no customers
                 
                 # Select a random customer from available customers
                 customer = available_customers.sample(n=1).iloc[0]
@@ -541,8 +573,44 @@ class RealisticAirlineBookingsGenerator:
         
         if len(invalid_bookings) > 0:
             print(f"❌ ERROR: Found {len(invalid_bookings)} bookings with dates before registration!")
-            print("First few invalid bookings:")
-            print(invalid_bookings[['booking_id', 'booking_date', 'date_of_registration']].head())
+            print("Fixing invalid bookings...")
+            
+            # Fix invalid bookings by adjusting booking dates to be after registration
+            for idx, invalid_booking in invalid_bookings.iterrows():
+                # Set booking date to be at least 1 day after registration
+                min_booking_date = invalid_booking['date_of_registration'] + timedelta(days=1)
+                current_booking_date = invalid_booking['booking_date']
+                
+                # If current booking date is before registration, adjust it
+                if current_booking_date < min_booking_date:
+                    # Find the original flight departure for this booking
+                    flight_match = flight_data[flight_data['planning_id'] == invalid_booking['planning_id']]
+                    if not flight_match.empty:
+                        flight_departure = flight_match.iloc[0]['scheduled_departure']
+                        
+                        # Ensure we have a valid window
+                        if min_booking_date < flight_departure:
+                            days_available = (flight_departure - min_booking_date).days
+                            if days_available > 0:
+                                random_days = np.random.randint(0, min(days_available, 30))
+                                new_booking_date = min_booking_date + timedelta(days=random_days)
+                                bookings_df.loc[bookings_df['booking_id'] == invalid_booking['booking_id'], 'booking_date'] = new_booking_date
+            
+            # Re-validate after fixing
+            validation_df = bookings_df.merge(
+                self.main_holders[['client_id', 'date_of_registration']], 
+                left_on='customer_id', 
+                right_on='client_id', 
+                how='left'
+            )
+            invalid_bookings = validation_df[validation_df['booking_date'] < validation_df['date_of_registration']]
+            
+            if len(invalid_bookings) > 0:
+                print(f"❌ Still found {len(invalid_bookings)} invalid bookings after fix!")
+                print("Sample of remaining invalid bookings:")
+                print(invalid_bookings[['booking_id', 'booking_date', 'date_of_registration']].head())
+            else:
+                print("✅ SUCCESS: All booking dates are after customer registration dates")
         else:
             print("✅ SUCCESS: All booking dates are after customer registration dates")
         

@@ -217,41 +217,42 @@ class UltraRealisticFastCheckInsGenerator:
         
         return seat_map
 
-    def _calculate_ultra_realistic_status_probs(self, planning_id: str, total_flight_passengers: int = None) -> Dict[str, float]:
-        """Calculate ultra-realistic status probabilities based on multiple factors including flight size."""
+    def _calculate_ultra_realistic_status_probs(self, planning_id: str, total_flight_passengers: int, checked_in_count: int, remaining_passengers: int) -> Dict[str, float]:
+        """Calculate ultra-realistic status probabilities based on multiple factors including flight size and checked-in count."""
         load_factor = self.flight_load_factors.get(planning_id, 0.5)
         probs = self.base_status_probs.copy()
         
-        # NEW RULE: For flights with less than 75 passengers, everyone checks in
-        if total_flight_passengers is not None and total_flight_passengers < 75:
-            return {
-                'checked_in': 1.0,
-                'no_show': 0.0,
-                'ticket_bumping': 0.0,
-                'denied_boarding': 0.0
-            }
-        
-        # Existing realistic adjustments based on load factor for larger flights
-        if load_factor > 1.15:  # Severely overbooked
-            probs['ticket_bumping'] = 0.20
-            probs['denied_boarding'] = 0.12
-            probs['no_show'] = 0.03  # People show up when they know it's overbooked
-            probs['checked_in'] = 0.65
-        elif load_factor > 1.05:  # Moderately overbooked
-            probs['ticket_bumping'] = 0.12
-            probs['denied_boarding'] = 0.08
-            probs['no_show'] = 0.04
-            probs['checked_in'] = 0.76
-        elif load_factor > 0.95:  # Nearly full
-            probs['ticket_bumping'] = 0.06
-            probs['denied_boarding'] = 0.03
-            probs['no_show'] = 0.06
-            probs['checked_in'] = 0.85
-        elif load_factor < 0.3:  # Very empty
-            probs['no_show'] = 0.15  # More no-shows on empty flights
-            probs['ticket_bumping'] = 0.005
-            probs['denied_boarding'] = 0.002
-            probs['checked_in'] = 0.843
+        # Ensure at least 50 checked-in passengers
+        passengers_needed = max(0, 50 - checked_in_count)
+        if remaining_passengers > 0 and passengers_needed > 0:
+            # Force check-in for enough passengers to reach 50
+            check_in_prob = min(1.0, passengers_needed / remaining_passengers)
+            probs['checked_in'] = check_in_prob
+            probs['no_show'] = (1 - check_in_prob) * 0.667  # Redistribute remaining probability
+            probs['ticket_bumping'] = (1 - check_in_prob) * 0.167
+            probs['denied_boarding'] = (1 - check_in_prob) * 0.166
+        else:
+            # Apply realistic adjustments based on load factor for remaining passengers
+            if load_factor > 1.15:  # Severely overbooked
+                probs['ticket_bumping'] = 0.20
+                probs['denied_boarding'] = 0.12
+                probs['no_show'] = 0.03
+                probs['checked_in'] = 0.65
+            elif load_factor > 1.05:  # Moderately overbooked
+                probs['ticket_bumping'] = 0.12
+                probs['denied_boarding'] = 0.08
+                probs['no_show'] = 0.04
+                probs['checked_in'] = 0.76
+            elif load_factor > 0.95:  # Nearly full
+                probs['ticket_bumping'] = 0.06
+                probs['denied_boarding'] = 0.03
+                probs['no_show'] = 0.06
+                probs['checked_in'] = 0.85
+            elif load_factor < 0.3:  # Very empty
+                probs['no_show'] = 0.15
+                probs['ticket_bumping'] = 0.005
+                probs['denied_boarding'] = 0.002
+                probs['checked_in'] = 0.843
         
         # Normalize probabilities
         total = sum(probs.values())
@@ -398,12 +399,12 @@ class UltraRealisticFastCheckInsGenerator:
             return self.faker.name()
 
     def generate_checkins(self):
-        """Generate ultra-realistic check-ins dataset with maximum speed and realism."""
+        """Generate ultra-realistic check-ins dataset with minimum 50 checked-in passengers per flight."""
         print(f"Generating ULTRA-REALISTIC check-ins for {self.TARGET_YEAR}")
         print("Ultra-realistic features:")
         print("- Proper seat maps with blocking and conflict prevention")
         print("- Load factor based bumping/denial with realistic thresholds")
-        print("- 100% check-in rate for flights with <75 passengers")  # NEW FEATURE
+        print("- Minimum 50 checked-in passengers per flight")
         print("- Seat preference algorithms (window/aisle)")
         print("- Class-based check-in timing patterns")
         print("- Group booking aware name generation")
@@ -436,12 +437,12 @@ class UltraRealisticFastCheckInsGenerator:
             flight_seat_maps[planning_id] = self._create_flight_seat_map(aircraft_type, aircraft_capacity)
             flight_gates[planning_id] = self._generate_realistic_gate(origin_airport, aircraft_type)
             
-            # Get realistic status probabilities for this flight (now considering flight size)
-            status_probs = self._calculate_ultra_realistic_status_probs(planning_id, total_flight_passengers)
+            # Track checked-in passengers
+            checked_in_count = 0
+            total_passenger_count = flight_bookings['actual_passenger_count'].sum() + flight_bookings['num_infants'].sum()
             
-            # Log small flights for verification
-            if total_flight_passengers < 75:
-                print(f"Small flight {planning_id}: {total_flight_passengers} passengers - 100% check-in rate applied")
+            # Shuffle bookings to randomize check-in order
+            flight_bookings = flight_bookings.sample(frac=1).reset_index(drop=True)
             
             # Process each booking on this flight
             for _, booking in flight_bookings.iterrows():
@@ -455,10 +456,10 @@ class UltraRealisticFastCheckInsGenerator:
                     scheduled_departure, booking_class, checkin_counter
                 )
                 
-                # Determine check-in status (now using flight-size-aware probabilities)
-                checkin_status = np.random.choice(
-                    list(status_probs.keys()), 
-                    p=list(status_probs.values())
+                # Determine check-in status
+                remaining_passengers = total_passenger_count - (checkin_counter - 1)
+                status_probs = self._calculate_ultra_realistic_status_probs(
+                    planning_id, total_flight_passengers, checked_in_count, remaining_passengers
                 )
                 
                 # Generate passengers for this booking
@@ -478,6 +479,12 @@ class UltraRealisticFastCheckInsGenerator:
                         # Generate realistic name
                         passenger_name = self._generate_realistic_name(
                             customer_id, passenger_idx, passenger_type, group_booking_type
+                        )
+                        
+                        # Assign check-in status for this passenger
+                        checkin_status = np.random.choice(
+                            list(status_probs.keys()), 
+                            p=list(status_probs.values())
                         )
                         
                         # Assign seat with ultra-realistic logic
@@ -524,10 +531,12 @@ class UltraRealisticFastCheckInsGenerator:
                             'checkin_time': checkin_time,
                             'booking_class': booking_class,
                             'group_booking_type': group_booking_type,
-                            'total_flight_passengers': total_flight_passengers  # Track for analysis
+                            'total_flight_passengers': total_flight_passengers
                         }
                         
                         checkins.append(checkin)
+                        if checkin_status == 'checked_in' and passenger_type != 'infant':
+                            checked_in_count += 1
                         checkin_counter += 1
                         passenger_idx += 1
         
@@ -542,6 +551,20 @@ class UltraRealisticFastCheckInsGenerator:
         checkins_df['gate_number'] = checkins_df['gate_number'].astype('category')
         checkins_df['checkin_time'] = pd.to_datetime(checkins_df['checkin_time'])
         
+        # Validate minimum 50 checked-in passengers per flight
+        checked_in_passengers = checkins_df[
+            (checkins_df['checkin_status'] == 'checked_in') & 
+            (checkins_df['passenger_type'] != 'infant')
+        ].groupby('planning_id').size()
+        underbooked_flights = checked_in_passengers[checked_in_passengers < 50]
+        
+        if not underbooked_flights.empty:
+            print(f"\n❌ ERROR: Found {len(underbooked_flights)} flights with fewer than 50 checked-in passengers!")
+            print("Underbooked flights (planning_id, checked-in passengers):")
+            print(underbooked_flights.to_string())
+        else:
+            print("\n✅ SUCCESS: All flights have at least 50 checked-in passengers")
+        
         print(f"\n=== ULTRA-REALISTIC CHECK-IN GENERATION COMPLETE ===")
         print(f"Total check-ins generated: {len(checkins_df):,}")
         print(f"Unique bookings: {checkins_df['booking_id'].nunique():,}")
@@ -549,12 +572,12 @@ class UltraRealisticFastCheckInsGenerator:
         print(f"Unique flights: {checkins_df['planning_id'].nunique():,}")
         
         # Analyze small vs large flights
-        small_flights = checkins_df[checkins_df['total_flight_passengers'] < 75]
-        large_flights = checkins_df[checkins_df['total_flight_passengers'] >= 75]
+        small_flights = checkins_df[checkins_df['total_flight_passengers'] < 50]
+        large_flights = checkins_df[checkins_df['total_flight_passengers'] >= 50]
         
         print(f"\nFlight size analysis:")
-        print(f"Small flights (<75 passengers): {small_flights['planning_id'].nunique()} flights, {len(small_flights):,} check-ins")
-        print(f"Large flights (≥75 passengers): {large_flights['planning_id'].nunique()} flights, {len(large_flights):,} check-ins")
+        print(f"Small flights (<50 passengers): {small_flights['planning_id'].nunique()} flights, {len(small_flights):,} check-ins")
+        print(f"Large flights (≥50 passengers): {large_flights['planning_id'].nunique()} flights, {len(large_flights):,} check-ins")
         
         print(f"\nCheck-in status distribution:")
         for status, count in checkins_df['checkin_status'].value_counts().items():
@@ -611,7 +634,8 @@ class UltraRealisticFastCheckInsGenerator:
             'valid_luggage_weights': True,
             'valid_seat_allocations': True,
             'realistic_status_distribution': True,
-            'valid_gate_assignments': True
+            'valid_gate_assignments': True,
+            'minimum_50_checked_in_passengers': True
         }
         
         # Check for duplicate check-in IDs
@@ -675,6 +699,15 @@ class UltraRealisticFastCheckInsGenerator:
         if not checkins_df['gate_number'].isin(valid_gates).all():
             validation_results['valid_gate_assignments'] = False
             print("Validation Error: Invalid gate assignments detected")
+        
+        # Validate minimum 50 checked-in passengers per flight
+        checked_in_passengers = checkins_df[
+            (checkins_df['checkin_status'] == 'checked_in') & 
+            (checkins_df['passenger_type'] != 'infant')
+        ].groupby('planning_id').size()
+        if (checked_in_passengers < 50).any():
+            validation_results['minimum_50_checked_in_passengers'] = False
+            print("Validation Error: Some flights have fewer than 50 checked-in passengers")
         
         print("\nValidation Summary:")
         for check, passed in validation_results.items():
