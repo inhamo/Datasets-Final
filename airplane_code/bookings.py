@@ -33,6 +33,11 @@ class FastAirlineBookingsGenerator:
             if client_files:
                 self.clients_df = pd.concat(client_files, ignore_index=True)
                 self.clients_df = self.clients_df.drop_duplicates(subset=['client_id'], keep='last')
+                
+                # Convert date_of_registration early to avoid comparison issues
+                self.clients_df['date_of_registration'] = pd.to_datetime(
+                    self.clients_df['date_of_registration'], errors='coerce'
+                )
             else:
                 raise FileNotFoundError(f"No client data files found from {BASE_YEAR} to {target_year}")
             
@@ -60,6 +65,11 @@ class FastAirlineBookingsGenerator:
             else:
                 raise FileNotFoundError(f"No route data files found from {BASE_YEAR} to {target_year}")
             
+            # Additional validation for registration dates
+            target_year_start = pd.to_datetime(f"{target_year}-01-01")
+            if (self.clients_df['date_of_registration'] > target_year_start).any():
+                print("Warning: Some registration dates are after the target year start. These will be adjusted in _prepare_data.")
+            
         except FileNotFoundError as e:
             raise FileNotFoundError(f"Missing data file: {str(e)}")
         except Exception as e:
@@ -80,7 +90,7 @@ class FastAirlineBookingsGenerator:
             
         self.clients_df['dob'] = pd.to_datetime(self.clients_df['dob'], errors='coerce')
         
-        # More robust registration date handling
+        # More robust registration date handling (already converted in __init__, but re-do for safety)
         self.clients_df['date_of_registration'] = pd.to_datetime(
             self.clients_df['date_of_registration'], errors='coerce', format='mixed'
         )
@@ -107,10 +117,10 @@ class FastAirlineBookingsGenerator:
             self.clients_df.loc[invalid_dates_mask, 'date_of_registration'] = random_dates
         
         # Ensure all registration dates are before the target year's flights
-        late_registration_mask = self.clients_df['date_of_registration'] >= earliest_flight
+        max_registration_date = earliest_flight - timedelta(hours=1)
+        late_registration_mask = self.clients_df['date_of_registration'] > max_registration_date
         if late_registration_mask.any():
-            print(f"Warning: {late_registration_mask.sum()} registration dates were too late. Adjusting...")
-            # Move these registrations to be 1-30 days before the earliest flight
+            print(f"Warning: {late_registration_mask.sum()} registration dates after earliest flight. Adjusting...")
             days_before = np.random.randint(1, 31, size=late_registration_mask.sum())
             adjusted_dates = [earliest_flight - timedelta(days=int(days)) for days in days_before]
             self.clients_df.loc[late_registration_mask, 'date_of_registration'] = adjusted_dates
@@ -221,7 +231,10 @@ class FastAirlineBookingsGenerator:
                 168    # 1 week average for others
             )
         )
-        self.booking_offsets = [stats.expon.rvs(scale=scale) for scale in booking_scales]
+        self.booking_offsets = np.minimum(
+            stats.expon.rvs(scale=booking_scales, size=self.num_samples),
+            720  # Cap at 30 days to avoid extreme offsets
+        )
         
         # Group discounts and pricing variations
         group_discount = np.where(self.is_group_booking, 
@@ -292,23 +305,20 @@ class FastAirlineBookingsGenerator:
         if isinstance(flight_departure, str):
             flight_departure = pd.to_datetime(flight_departure)
         
-        # Calculate proposed booking date
-        proposed_booking_date = flight_departure - timedelta(hours=booking_offset_hours)
-        
-        # Ensure booking is after registration (add minimum 1 hour buffer)
         min_booking_date = customer_reg_date + timedelta(hours=1)
+        max_hours_before = (flight_departure - min_booking_date).total_seconds() / 3600
         
-        # If proposed date is too early, adjust it
+        if max_hours_before <= 0:
+            # If registration is too close to or after flight, set booking date to just after registration
+            return min_booking_date + timedelta(hours=np.random.uniform(0.5, 1))
+        
+        # Cap the booking offset to the available time window
+        adjusted_offset = min(booking_offset_hours, max_hours_before)
+        proposed_booking_date = flight_departure - timedelta(hours=adjusted_offset)
+        
+        # Double-check that the booking date is after registration
         if proposed_booking_date < min_booking_date:
-            # Calculate available time window
-            max_hours_before = (flight_departure - min_booking_date).total_seconds() / 3600
-            if max_hours_before > 0:
-                # Use exponential distribution within available window
-                adjusted_offset = min(stats.expon.rvs(scale=min(168, max_hours_before/3)), max_hours_before)
-                proposed_booking_date = flight_departure - timedelta(hours=adjusted_offset)
-            else:
-                # Very close to flight time, book within last few hours
-                proposed_booking_date = flight_departure - timedelta(hours=np.random.uniform(0.5, 3))
+            proposed_booking_date = min_booking_date + timedelta(hours=np.random.uniform(0.5, 1))
         
         return proposed_booking_date
 
@@ -414,8 +424,16 @@ class FastAirlineBookingsGenerator:
             target_bookings = flight['target_bookings']
             current_bookings = 0
             
-            while current_bookings < target_bookings and idx < len(selected_customers):
-                customer = selected_customers.iloc[idx]
+            # Filter customers with registration dates before this flight
+            valid_customers = selected_customers[
+                selected_customers['date_of_registration'] < flight['scheduled_departure'] - timedelta(hours=1)
+            ].reset_index(drop=True)
+            if valid_customers.empty:
+                continue
+            
+            customer_idx = 0
+            while current_bookings < target_bookings and customer_idx < len(valid_customers) and idx < len(selected_customers):
+                customer = valid_customers.iloc[customer_idx]
                 num_adults, num_children, num_infants = self.random_passenger_types[idx]
                 total_passengers = num_adults + num_children
                 
@@ -486,13 +504,13 @@ class FastAirlineBookingsGenerator:
                 bookings.append(booking)
                 current_bookings += total_passengers
                 booking_counter += 1
+                customer_idx += 1
                 idx += 1
         
         bookings_df = pd.DataFrame(bookings)
         bookings_df = self._find_return_flights(flight_data, bookings_df)
-        bookings_df = self._introduce_data_errors(bookings_df)
         
-        # Validate that all booking dates are after registration dates
+        # Post-process to fix any remaining invalid bookings
         validation_df = bookings_df.merge(
             self.main_holders[['client_id', 'date_of_registration']], 
             left_on='customer_id', 
@@ -502,7 +520,26 @@ class FastAirlineBookingsGenerator:
         invalid_bookings = validation_df[validation_df['booking_date'] < validation_df['date_of_registration']]
         
         if len(invalid_bookings) > 0:
-            print(f"Warning: Found {len(invalid_bookings)} bookings with dates before registration. This should not happen.")
+            print(f"Fixing {len(invalid_bookings)} invalid bookings...")
+            for idx in invalid_bookings.index:
+                reg_date = validation_df.loc[idx, 'date_of_registration']
+                flight_dep = bookings_df.loc[idx, 'scheduled_departure']
+                bookings_df.loc[idx, 'booking_date'] = self._calculate_realistic_booking_date(
+                    reg_date, flight_dep, stats.expon.rvs(scale=168)
+                )
+        
+        bookings_df = self._introduce_data_errors(bookings_df)
+        
+        # Final validation
+        validation_df = bookings_df.merge(
+            self.main_holders[['client_id', 'date_of_registration']], 
+            left_on='customer_id', 
+            right_on='client_id', 
+            how='left'
+        )
+        invalid_bookings = validation_df[validation_df['booking_date'] < validation_df['date_of_registration']]
+        if len(invalid_bookings) > 0:
+            print(f"Error: {len(invalid_bookings)} bookings still invalid after correction!")
         else:
             print("✓ All booking dates are after customer registration dates")
         
