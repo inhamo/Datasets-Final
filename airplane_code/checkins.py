@@ -10,15 +10,16 @@ import warnings
 import os
 warnings.filterwarnings('ignore')
 
-class RealisticCheckInsGenerator:
+class Minimum75CheckInsGenerator:
     def __init__(self, target_year: int = 2021):
         """
-        Initialize with target year and realistic check-in parameters.
+        Initialize generator that ensures MINIMUM 75 check-ins per flight.
         
         Args:
             target_year (int): Year to generate check-ins for
         """
         self.TARGET_YEAR = target_year
+        self.MIN_CHECKINS_PER_FLIGHT = 75
         
         # Load data
         try:
@@ -30,17 +31,7 @@ class RealisticCheckInsGenerator:
         except FileNotFoundError as e:
             raise FileNotFoundError(f"Missing data file for {target_year}: {str(e)}")
         
-        # REALISTIC check-in rates - industry standard
-        self.realistic_checkin_rates = {
-            'domestic_short': 0.92,    # Domestic flights under 2 hours
-            'domestic_medium': 0.90,   # Domestic flights 2-4 hours  
-            'domestic_long': 0.88,     # Domestic flights over 4 hours
-            'international': 0.85,     # International flights
-            'business_class': 0.95,    # Business class has higher show rates
-            'group_bookings': 0.98     # Group bookings have very high show rates
-        }
-        
-        # Realistic seat configurations
+        # Seat configurations for different aircraft
         self.seat_configs = {
             'Boeing 737-800': {'rows': 32, 'layout': ['A', 'B', 'C', 'D', 'E', 'F'], 'business_rows': 4},
             'Boeing 737-400': {'rows': 25, 'layout': ['A', 'B', 'C', 'D', 'E', 'F'], 'business_rows': 3},
@@ -50,10 +41,10 @@ class RealisticCheckInsGenerator:
             'Embraer E170': {'rows': 19, 'layout': ['A', 'C', 'D', 'F'], 'business_rows': 4},
             'ATR 72': {'rows': 18, 'layout': ['A', 'C', 'D', 'F'], 'business_rows': 0},
             'Bombardier Q400': {'rows': 20, 'layout': ['A', 'C', 'D', 'F'], 'business_rows': 0},
-            'default': {'rows': 25, 'layout': ['A', 'B', 'C', 'D', 'E', 'F'], 'business_rows': 3}
+            'default': {'rows': 35, 'layout': ['A', 'B', 'C', 'D', 'E', 'F'], 'business_rows': 5}  # Larger default
         }
         
-        # Initialize Faker for realistic names
+        # Initialize Faker for generating names
         self.faker = Faker(['en_US', 'en_GB', 'zu_ZA'])
         
         # Prepare data
@@ -67,12 +58,10 @@ class RealisticCheckInsGenerator:
         self.clients_df['date_of_registration'] = pd.to_datetime(self.clients_df['date_of_registration'])
         self.clients_df['dob'] = pd.to_datetime(self.clients_df['dob'])
         
-        # Filter valid bookings (only confirmed bookings should generate check-ins)
-        self.valid_bookings = self.bookings_df[
-            self.bookings_df['booking_status'] == 'confirmed'
-        ].copy()
+        # Get all bookings (including cancelled ones for potential check-ins)
+        self.valid_bookings = self.bookings_df.copy()
         
-        # Extract actual passenger count from bookings
+        # Calculate passenger count
         self.valid_bookings['actual_passenger_count'] = (
             self.valid_bookings['num_adults'] + self.valid_bookings['num_children']
         )
@@ -96,7 +85,7 @@ class RealisticCheckInsGenerator:
         
         # Clean data
         self.checkin_data['aircraft_type'] = self.checkin_data['aircraft_model'].fillna('default')
-        self.checkin_data['aircraft_capacity'] = self.checkin_data['capacity'].fillna(150)
+        self.checkin_data['aircraft_capacity'] = self.checkin_data['capacity'].fillna(200)  # Larger default
         
         # Remove invalid records
         self.checkin_data = self.checkin_data.dropna(subset=['planning_id', 'scheduled_departure'])
@@ -104,118 +93,74 @@ class RealisticCheckInsGenerator:
         # Create customer lookup for names
         self.customer_names = dict(zip(self.clients_df['client_id'], self.clients_df['name']))
         
-        # Calculate flight statistics
-        passengers_per_flight = self.checkin_data.groupby('planning_id')['actual_passenger_count'].sum()
+        # Get unique flights
+        self.unique_flights = self.checkin_data['planning_id'].unique()
         
         print(f"Data prepared for {self.TARGET_YEAR}:")
-        print(f"- {len(self.valid_bookings):,} confirmed bookings")
-        print(f"- {len(self.checkin_data):,} check-in eligible records")
-        print(f"- {self.checkin_data['planning_id'].nunique()} unique flights")
-        print(f"- Average passengers per flight: {passengers_per_flight.mean():.1f}")
-        print(f"- Min passengers per flight: {passengers_per_flight.min()}")
-        print(f"- Max passengers per flight: {passengers_per_flight.max()}")
+        print(f"- {len(self.valid_bookings):,} total bookings")
+        print(f"- {len(self.checkin_data):,} booking records with flight data")
+        print(f"- {len(self.unique_flights)} unique flights")
+        print(f"- MINIMUM {self.MIN_CHECKINS_PER_FLIGHT} check-ins will be generated per flight")
 
-    def _determine_flight_type(self, origin: str, destination: str, scheduled_departure: datetime) -> str:
-        """Determine flight type for realistic check-in rates."""
-        domestic_airports = {'JNB', 'CPT', 'DBN', 'PLZ', 'BFN', 'ELS', 'GRJ', 'HDS', 'KIM', 'MQP', 'NTY', 'PZB', 'SBU', 'UTN', 'WEL'}
-        
-        origin_domestic = any(airport in str(origin) for airport in domestic_airports)
-        dest_domestic = any(airport in str(destination) for airport in domestic_airports)
-        
-        if origin_domestic and dest_domestic:
-            if random.random() < 0.6:  # 60% short domestic
-                return 'domestic_short'
-            elif random.random() < 0.8:  # 20% medium domestic
-                return 'domestic_medium'
-            else:  # 20% long domestic
-                return 'domestic_long'
-        else:
-            return 'international'
-
-    def _calculate_realistic_checkin_probability(self, booking: pd.Series) -> float:
-        """Calculate realistic check-in probability based on multiple factors."""
-        flight_type = self._determine_flight_type(
-            booking['origin_airport'], 
-            booking['destination_airport'], 
-            booking['scheduled_departure']
-        )
-        
-        base_prob = self.realistic_checkin_rates[flight_type]
-        
-        if booking['booking_class'] == 'business':
-            base_prob = max(base_prob, self.realistic_checkin_rates['business_class'])
-        
-        if booking['group_booking_type'] != 'individual' or booking['num_adults'] >= 4:
-            base_prob = max(base_prob, self.realistic_checkin_rates['group_bookings'])
-        
-        days_in_advance = (booking['scheduled_departure'] - booking['booking_date']).days
-        if days_in_advance > 30:
-            base_prob += 0.02
-        elif days_in_advance < 2:
-            base_prob -= 0.05
-        
-        if booking.get('is_special_needs', False) or booking.get('is_assisted', False):
-            base_prob += 0.03
-        
-        return max(0.75, min(0.98, base_prob))
-
-    def _generate_realistic_checkin_time(self, scheduled_departure: datetime, booking_class: str) -> datetime:
-        """Generate realistic check-in time."""
-        if booking_class == 'business':
-            if random.random() < 0.7:  # 70% online check-in
-                hours_before = random.uniform(2, 18)
-            else:  # Airport check-in
-                hours_before = random.uniform(1, 2.5)
-        else:
-            if random.random() < 0.8:  # 80% online check-in
-                hours_before = random.uniform(4, 24)
-            else:  # Airport check-in
-                hours_before = random.uniform(1.5, 3)
-        
-        return scheduled_departure - timedelta(hours=hours_before)
-
-    def _create_seat_map(self, aircraft_type: str, capacity: int) -> Dict[str, bool]:
-        """Create seat map for aircraft."""
+    def _create_expanded_seat_map(self, aircraft_type: str, min_capacity: int = 75) -> Dict[str, bool]:
+        """Create seat map with enough seats for minimum passengers."""
         config = self.seat_configs.get(aircraft_type, self.seat_configs['default'])
-        seat_map = {}
         
-        for row in range(1, config['rows'] + 1):
+        # Calculate how many rows we need for minimum capacity
+        seats_per_row = len(config['layout'])
+        min_rows = max(config['rows'], (min_capacity + seats_per_row - 1) // seats_per_row)
+        
+        seat_map = {}
+        for row in range(1, min_rows + 1):
             for letter in config['layout']:
                 seat = f"{row}{letter}"
                 seat_map[seat] = True
         
+        # Block 2% of seats randomly (but ensure we still have enough)
         total_seats = len(seat_map)
-        blocked_count = max(1, int(total_seats * 0.02))
-        available_seats = list(seat_map.keys())
-        blocked = random.sample(available_seats, min(blocked_count, len(available_seats)))
+        max_blocked = max(0, total_seats - min_capacity - 5)  # Leave buffer
+        blocked_count = min(max_blocked, int(total_seats * 0.02))
         
-        for seat in blocked:
-            seat_map[seat] = False
+        if blocked_count > 0:
+            available_seats = list(seat_map.keys())
+            blocked = random.sample(available_seats, blocked_count)
+            for seat in blocked:
+                seat_map[seat] = False
         
         return seat_map
 
-    def _assign_seat(self, seat_map: Dict[str, bool], aircraft_type: str, booking_class: str, passenger_type: str) -> Optional[str]:
-        """Assign seat with realistic logic."""
+    def _assign_seat(self, seat_map: Dict[str, bool], aircraft_type: str, booking_class: str) -> str:
+        """Assign seat, creating new ones if needed."""
         config = self.seat_configs.get(aircraft_type, self.seat_configs['default'])
         available_seats = [seat for seat, available in seat_map.items() if available]
         
+        # If no seats available, create emergency seats
         if not available_seats:
-            return None
+            emergency_seat = f"E{len(seat_map) + 1}A"
+            seat_map[emergency_seat] = False
+            return emergency_seat
         
+        # Try to assign appropriate class seats
         if booking_class == 'business' and config['business_rows'] > 0:
             business_seats = [s for s in available_seats if int(s[:-1]) <= config['business_rows']]
             if business_seats:
-                available_seats = business_seats
-        else:
-            economy_seats = [s for s in available_seats if int(s[:-1]) > config['business_rows']]
-            if economy_seats:
-                available_seats = economy_seats
+                seat = business_seats[0]
+                seat_map[seat] = False
+                return seat
         
-        if not available_seats:
-            return None
+        # Assign any available seat
+        seat = available_seats[0]
+        seat_map[seat] = False
+        return seat
+
+    def _generate_realistic_checkin_time(self, scheduled_departure: datetime) -> datetime:
+        """Generate realistic check-in time."""
+        if random.random() < 0.75:  # 75% online check-in
+            hours_before = random.uniform(2, 24)
+        else:  # Airport check-in
+            hours_before = random.uniform(1, 3)
         
-        available_seats.sort(key=lambda x: (int(x[:-1]), x[-1]))
-        return available_seats[0]
+        return scheduled_departure - timedelta(hours=hours_before)
 
     def _assign_luggage(self, passenger_type: str, booking_class: str) -> Tuple[float, float]:
         """Assign realistic luggage weights."""
@@ -229,180 +174,202 @@ class RealisticCheckInsGenerator:
             weight = random.uniform(12, 28)
             max_weight = 32 if booking_class == 'business' else 23
         
+        # Some passengers have lighter or heavier luggage
         if random.random() < 0.15:
             weight *= 0.4
-        elif random.random() < 0.20:
+        elif random.random() < 0.10:
             weight = max_weight * random.uniform(0.85, 0.98)
         
         return round(weight, 2), max_weight
 
-    def _generate_gate(self, origin_airport: str, aircraft_type: str) -> str:
-        """Generate realistic gate assignment."""
+    def _generate_gate(self, origin_airport: str) -> str:
+        """Generate gate assignment."""
         large_airports = ['JNB', 'CPT', 'DBN', 'PLZ']
         
         if origin_airport in large_airports:
-            gates = [f"{letter}{num}" for letter in ['A', 'B', 'C'] for num in range(1, 25)]
+            gates = [f"{letter}{num}" for letter in ['A', 'B', 'C'] for num in range(1, 30)]
         else:
-            gates = [f"A{num}" for num in range(1, 12)]
+            gates = [f"A{num}" for num in range(1, 15)]
         
         return random.choice(gates)
 
-    def _generate_passenger_name(self, customer_id: str, passenger_idx: int, passenger_type: str, group_type: str) -> str:
-        """Generate realistic passenger name."""
-        main_name = self.customer_names.get(customer_id, f"Customer_{customer_id}")
+    def _create_synthetic_passenger(self, flight_info: Dict, passenger_idx: int) -> Dict:
+        """Create a synthetic passenger for flights needing more check-ins."""
+        passenger_types = ['adult'] * 85 + ['child'] * 14 + ['infant'] * 1
+        passenger_type = random.choice(passenger_types)
         
-        if passenger_idx == 0 and passenger_type != 'infant':
-            return main_name
+        booking_classes = ['economy'] * 85 + ['business'] * 15
+        booking_class = random.choice(booking_classes)
         
-        if passenger_type == 'infant':
-            surname = main_name.split()[-1] if ' ' in main_name else main_name
-            return f"Infant {surname}"
+        # Generate synthetic booking ID
+        synthetic_booking_id = f"SYN{self.TARGET_YEAR}{passenger_idx:06d}"
+        synthetic_customer_id = f"CUST{self.TARGET_YEAR}{passenger_idx:05d}"
         
-        if group_type == 'family':
-            if ' ' in main_name:
-                surname = main_name.split()[-1]
-                return f"{self.faker.first_name()} {surname}"
-            else:
-                return self.faker.name()
-        else:
-            return self.faker.name()
+        return {
+            'booking_id': synthetic_booking_id,
+            'customer_id': synthetic_customer_id,
+            'passenger_name': self.faker.name(),
+            'passenger_type': passenger_type,
+            'booking_class': booking_class,
+            'group_booking_type': 'individual',
+            'scheduled_departure': flight_info['scheduled_departure'],
+            'origin_airport': flight_info['origin_airport'],
+            'destination_airport': flight_info['destination_airport'],
+            'aircraft_type': flight_info['aircraft_type'],
+            'aircraft_capacity': flight_info['aircraft_capacity']
+        }
 
     def generate_checkins(self):
-        """Generate realistic check-ins with 100% check-in rate for flights with ≤75 passengers."""
-        print(f"Generating REALISTIC check-ins for {self.TARGET_YEAR}")
-        print("Realistic features:")
-        print("- Industry-standard check-in rates (85-98%) for flights with >75 passengers")
-        print("- 100% check-in rate for flights with ≤75 passengers (excluding infants)")
-        print("- Business class higher show rates")
-        print("- Group booking higher show rates")
-        print("- Proper seat allocation with blocking")
-        print("- Realistic luggage distributions")
+        """Generate check-ins ensuring minimum 75 per flight."""
+        print(f"Generating check-ins with MINIMUM {self.MIN_CHECKINS_PER_FLIGHT} per flight for {self.TARGET_YEAR}")
+        print("Strategy:")
+        print("- All existing passengers check in")
+        print("- Generate synthetic passengers to reach minimum 75 per flight")
+        print("- Expand aircraft capacity as needed")
+        print("- Assign seats to all checked-in passengers")
         
         checkins = []
         checkin_counter = 1
         flight_seat_maps = {}
         flight_gates = {}
         
-        flight_groups = self.checkin_data.groupby('planning_id')
-        
-        for planning_id, flight_bookings in tqdm(flight_groups, desc="Processing flights"):
+        for planning_id in tqdm(self.unique_flights, desc="Processing flights"):
+            flight_bookings = self.checkin_data[self.checkin_data['planning_id'] == planning_id]
+            
             if len(flight_bookings) == 0:
                 continue
             
             first_booking = flight_bookings.iloc[0]
-            aircraft_type = first_booking['aircraft_type']
-            aircraft_capacity = int(first_booking['aircraft_capacity'])
-            scheduled_departure = first_booking['scheduled_departure']
-            origin_airport = first_booking['origin_airport']
+            flight_info = {
+                'planning_id': planning_id,
+                'aircraft_type': first_booking['aircraft_type'],
+                'aircraft_capacity': max(int(first_booking['aircraft_capacity']), self.MIN_CHECKINS_PER_FLIGHT + 10),
+                'scheduled_departure': first_booking['scheduled_departure'],
+                'origin_airport': first_booking['origin_airport'],
+                'destination_airport': first_booking['destination_airport']
+            }
             
-            flight_seat_maps[planning_id] = self._create_seat_map(aircraft_type, aircraft_capacity)
-            flight_gates[planning_id] = self._generate_gate(origin_airport, aircraft_type)
+            # Create seat map and gate
+            flight_seat_maps[planning_id] = self._create_expanded_seat_map(
+                flight_info['aircraft_type'], 
+                self.MIN_CHECKINS_PER_FLIGHT + 20  # Buffer for infants and extras
+            )
+            flight_gates[planning_id] = self._generate_gate(flight_info['origin_airport'])
             
-            # Calculate total passengers (excluding infants)
-            total_passengers = flight_bookings['actual_passenger_count'].sum()
-            total_with_infants = total_passengers + flight_bookings['num_infants'].sum()
+            flight_passengers = []
             
-            # Determine if this is a small flight (≤75 passengers excluding infants)
-            is_small_flight = total_passengers <= 75
-            
-            checked_in_passengers = 0
-            
-            # Ensure enough seats for small flights
-            available_seats = sum(1 for seat, available in flight_seat_maps[planning_id].items() if available)
-            if is_small_flight and available_seats < total_passengers:
-                print(f"WARNING: Flight {planning_id} has {total_passengers} passengers but only {available_seats} seats available! Adjusting capacity.")
-                aircraft_capacity = max(aircraft_capacity, total_passengers)
-                flight_seat_maps[planning_id] = self._create_seat_map(aircraft_type, aircraft_capacity)
-            
+            # Add all existing passengers (they all check in)
             for _, booking in flight_bookings.iterrows():
-                checkin_probability = self._calculate_realistic_checkin_probability(booking)
+                passengers_in_booking = []
                 
-                # Create passenger list (adults, children, infants)
-                passengers = []
+                # Adults
                 for i in range(booking['num_adults']):
-                    passengers.append(('adult', i))
-                for i in range(booking['num_children']):
-                    passengers.append(('child', i + booking['num_adults']))
-                for i in range(booking['num_infants']):
-                    passengers.append(('infant', i + booking['num_adults'] + booking['num_children']))
-                
-                for passenger_type, passenger_idx in passengers:
-                    # CRITICAL FIX: Ensure 100% check-in for small flights (excluding infants)
-                    if is_small_flight and passenger_type != 'infant':
-                        checkin_status = 'checked_in'
-                    else:
-                        # For large flights or infants, use realistic probabilities
-                        will_checkin = random.random() < checkin_probability
-                        checkin_status = 'checked_in' if will_checkin else ('no_show' if random.random() < 0.8 else 'cancelled')
-                    
-                    passenger_name = self._generate_passenger_name(
-                        booking['customer_id'], passenger_idx, passenger_type, 
-                        booking.get('group_booking_type', 'individual')
-                    )
-                    
-                    checkin_time = self._generate_realistic_checkin_time(
-                        scheduled_departure, booking['booking_class']
-                    )
-                    
-                    seat_allocation = None
-                    if checkin_status == 'checked_in':
-                        if passenger_type == 'infant':
-                            seat_allocation = 'Lap'
-                        else:
-                            seat_allocation = self._assign_seat(
-                                flight_seat_maps[planning_id], aircraft_type,
-                                booking['booking_class'], passenger_type
-                            )
-                            if seat_allocation:
-                                flight_seat_maps[planning_id][seat_allocation] = False
-                            elif is_small_flight:
-                                # For small flights, we MUST have a seat - create emergency seat if needed
-                                print(f"ERROR: Flight {planning_id} (small flight) has no seat for passenger {passenger_name}! Forcing seat assignment.")
-                                seat_allocation = self._assign_seat(
-                                    flight_seat_maps[planning_id], aircraft_type,
-                                    booking['booking_class'], passenger_type
-                                ) or f"Emergency_{checkin_counter}"
-                                flight_seat_maps[planning_id][seat_allocation] = False
-                            else:
-                                checkin_status = 'denied_boarding'
-                    
-                    if checkin_status == 'checked_in' and passenger_type != 'infant':
-                        checked_in_passengers += 1
-                    
-                    luggage, max_luggage = self._assign_luggage(passenger_type, booking['booking_class'])
-                    
-                    checkin = {
-                        'checkin_id': f"CI{self.TARGET_YEAR}{checkin_counter:06d}",
+                    passengers_in_booking.append({
                         'booking_id': booking['booking_id'],
-                        'planning_id': planning_id,
                         'customer_id': booking['customer_id'],
-                        'passenger_name': passenger_name,
-                        'passenger_type': passenger_type,
-                        'checkin_status': checkin_status,
-                        'gate_number': flight_gates[planning_id],
-                        'seat_allocation': seat_allocation,
-                        'max_luggage': max_luggage,
-                        'checkin_luggage': luggage,
-                        'checkin_time': checkin_time,
+                        'passenger_name': self.customer_names.get(booking['customer_id'], f"Customer_{booking['customer_id']}") if i == 0 else self.faker.name(),
+                        'passenger_type': 'adult',
                         'booking_class': booking['booking_class'],
                         'group_booking_type': booking.get('group_booking_type', 'individual'),
-                        'total_flight_passengers': total_passengers
-                    }
-                    
-                    checkins.append(checkin)
-                    checkin_counter += 1
+                        'scheduled_departure': booking['scheduled_departure'],
+                        'origin_airport': booking['origin_airport'],
+                        'destination_airport': booking['destination_airport'],
+                        'aircraft_type': booking['aircraft_type'],
+                        'aircraft_capacity': flight_info['aircraft_capacity']
+                    })
+                
+                # Children
+                for i in range(booking['num_children']):
+                    passengers_in_booking.append({
+                        'booking_id': booking['booking_id'],
+                        'customer_id': booking['customer_id'],
+                        'passenger_name': self.faker.name(),
+                        'passenger_type': 'child',
+                        'booking_class': booking['booking_class'],
+                        'group_booking_type': booking.get('group_booking_type', 'individual'),
+                        'scheduled_departure': booking['scheduled_departure'],
+                        'origin_airport': booking['origin_airport'],
+                        'destination_airport': booking['destination_airport'],
+                        'aircraft_type': booking['aircraft_type'],
+                        'aircraft_capacity': flight_info['aircraft_capacity']
+                    })
+                
+                # Infants
+                for i in range(booking['num_infants']):
+                    passengers_in_booking.append({
+                        'booking_id': booking['booking_id'],
+                        'customer_id': booking['customer_id'],
+                        'passenger_name': f"Infant {self.faker.last_name()}",
+                        'passenger_type': 'infant',
+                        'booking_class': booking['booking_class'],
+                        'group_booking_type': booking.get('group_booking_type', 'individual'),
+                        'scheduled_departure': booking['scheduled_departure'],
+                        'origin_airport': booking['origin_airport'],
+                        'destination_airport': booking['destination_airport'],
+                        'aircraft_type': booking['aircraft_type'],
+                        'aircraft_capacity': flight_info['aircraft_capacity']
+                    })
+                
+                flight_passengers.extend(passengers_in_booking)
             
-            # Verify that small flights have 100% check-in rate
-            if is_small_flight:
-                expected_checked_in = total_passengers  # Excluding infants
-                if checked_in_passengers != expected_checked_in:
-                    print(f"ERROR: Flight {planning_id} has {total_passengers} passengers but only {checked_in_passengers} checked in!")
-                    # Force correction by updating check-in statuses
-                    self._force_small_flight_checkins(checkins, planning_id, expected_checked_in, checked_in_passengers)
+            # Count non-infant passengers
+            non_infant_passengers = [p for p in flight_passengers if p['passenger_type'] != 'infant']
+            current_count = len(non_infant_passengers)
+            
+            # Generate synthetic passengers if needed
+            if current_count < self.MIN_CHECKINS_PER_FLIGHT:
+                needed = self.MIN_CHECKINS_PER_FLIGHT - current_count
+                print(f"Flight {planning_id}: Adding {needed} synthetic passengers ({current_count} -> {self.MIN_CHECKINS_PER_FLIGHT})")
+                
+                for i in range(needed):
+                    synthetic_passenger = self._create_synthetic_passenger(flight_info, checkin_counter + i)
+                    flight_passengers.append(synthetic_passenger)
+            
+            # Generate check-ins for all passengers
+            for passenger in flight_passengers:
+                checkin_time = self._generate_realistic_checkin_time(passenger['scheduled_departure'])
+                
+                # All passengers check in (infants go on laps)
+                if passenger['passenger_type'] == 'infant':
+                    seat_allocation = 'Lap'
+                else:
+                    seat_allocation = self._assign_seat(
+                        flight_seat_maps[planning_id],
+                        passenger['aircraft_type'],
+                        passenger['booking_class']
+                    )
+                
+                luggage, max_luggage = self._assign_luggage(
+                    passenger['passenger_type'],
+                    passenger['booking_class']
+                )
+                
+                checkin = {
+                    'checkin_id': f"CI{self.TARGET_YEAR}{checkin_counter:06d}",
+                    'booking_id': passenger['booking_id'],
+                    'planning_id': planning_id,
+                    'customer_id': passenger['customer_id'],
+                    'passenger_name': passenger['passenger_name'],
+                    'passenger_type': passenger['passenger_type'],
+                    'checkin_status': 'checked_in',
+                    'gate_number': flight_gates[planning_id],
+                    'seat_allocation': seat_allocation,
+                    'max_luggage': max_luggage,
+                    'checkin_luggage': luggage,
+                    'checkin_time': checkin_time,
+                    'booking_class': passenger['booking_class'],
+                    'group_booking_type': passenger['group_booking_type'],
+                    'total_flight_passengers': len([p for p in flight_passengers if p['passenger_type'] != 'infant']),
+                    'aircraft_type': passenger['aircraft_type']
+                }
+                
+                checkins.append(checkin)
+                checkin_counter += 1
         
+        # Convert to DataFrame
         checkins_df = pd.DataFrame(checkins)
         
-        # Data type optimization
+        # Optimize data types
         checkins_df['checkin_status'] = checkins_df['checkin_status'].astype('category')
         checkins_df['passenger_type'] = checkins_df['passenger_type'].astype('category')
         checkins_df['booking_class'] = checkins_df['booking_class'].astype('category')
@@ -410,102 +377,63 @@ class RealisticCheckInsGenerator:
         checkins_df['gate_number'] = checkins_df['gate_number'].astype('category')
         checkins_df['checkin_time'] = pd.to_datetime(checkins_df['checkin_time'])
         
-        # Validation and reporting
         self._validate_and_report_results(checkins_df)
         
-        # Save results
+        # Save to file
         output_path = f'airplane_data/checkins_{self.TARGET_YEAR}.parquet'
         checkins_df.to_parquet(output_path, index=False)
         print(f"\nCheck-ins data saved to {output_path}")
         
         return checkins_df
 
-    def _force_small_flight_checkins(self, checkins: List[Dict], planning_id: str, expected: int, actual: int):
-        """Force correction for small flights that don't have 100% check-in rate."""
-        if actual >= expected:
-            return
-            
-        # Find passengers from this flight who are not checked in
-        flight_passengers = []
-        for i, checkin in enumerate(checkins):
-            if (checkin['planning_id'] == planning_id and 
-                checkin['passenger_type'] != 'infant' and 
-                checkin['checkin_status'] != 'checked_in'):
-                flight_passengers.append(i)
-        
-        # Randomly select passengers to change status to checked_in
-        needed_corrections = expected - actual
-        if needed_corrections > 0 and flight_passengers:
-            corrections = min(needed_corrections, len(flight_passengers))
-            to_correct = random.sample(flight_passengers, corrections)
-            
-            for idx in to_correct:
-                checkins[idx]['checkin_status'] = 'checked_in'
-                # Also assign a seat if needed
-                if checkins[idx]['seat_allocation'] is None:
-                    checkins[idx]['seat_allocation'] = f"Corrected_{idx}"
-
     def _validate_and_report_results(self, checkins_df: pd.DataFrame):
-        """Validate results and generate comprehensive report."""
-        # Calculate check-in rates excluding infants
-        checked_in_by_flight = checkins_df[
+        """Validate and report results."""
+        # Count non-infant checked-in passengers per flight
+        non_infant_checkins = checkins_df[
             (checkins_df['checkin_status'] == 'checked_in') & 
             (checkins_df['passenger_type'] != 'infant')
-        ].groupby('planning_id').size()
+        ]
         
-        total_passengers_by_flight = checkins_df[
-            checkins_df['passenger_type'] != 'infant'
-        ].groupby('planning_id').size()
+        checkins_per_flight = non_infant_checkins.groupby('planning_id').size()
         
-        checkin_rates = checked_in_by_flight / total_passengers_by_flight
-        
-        # Get flight sizes
-        flight_sizes = checkins_df.groupby('planning_id').agg({
-            'total_flight_passengers': 'first'
-        })['total_flight_passengers']
-        
-        # Identify small flights
-        small_flights = flight_sizes[flight_sizes <= 75]
-        large_flights = flight_sizes[flight_sizes > 75]
-        
-        # Check compliance for small flights
-        small_flight_compliance = []
-        for planning_id in small_flights.index:
-            if planning_id in checkin_rates.index:
-                rate = checkin_rates[planning_id]
-                small_flight_compliance.append(rate == 1.0)
-        
-        small_flight_success_rate = np.mean(small_flight_compliance) if small_flight_compliance else 1.0
-        
-        print(f"\n=== REALISTIC CHECK-IN GENERATION COMPLETE ===")
+        print(f"\n=== MINIMUM 75 CHECK-INS GENERATION COMPLETE ===")
         print(f"Total check-ins generated: {len(checkins_df):,}")
+        print(f"Total flights: {checkins_df['planning_id'].nunique():,}")
         print(f"Unique bookings: {checkins_df['booking_id'].nunique():,}")
         print(f"Unique customers: {checkins_df['customer_id'].nunique():,}")
-        print(f"Unique flights: {checkins_df['planning_id'].nunique():,}")
         
         print(f"\nCheck-in status distribution:")
         for status, count in checkins_df['checkin_status'].value_counts().items():
             pct = count / len(checkins_df)
             print(f"  {status}: {count:,} ({pct:.1%})")
         
-        print(f"\nFlight size distribution:")
-        print(f"  Small flights (≤75 passengers): {len(small_flights):,}")
-        print(f"  Large flights (>75 passengers): {len(large_flights):,}")
+        print(f"\nPassenger type distribution:")
+        for ptype, count in checkins_df['passenger_type'].value_counts().items():
+            pct = count / len(checkins_df)
+            print(f"  {ptype}: {count:,} ({pct:.1%})")
         
-        print(f"\nCheck-in rate statistics (excluding infants):")
-        print(f"  Average check-in rate: {checkin_rates.mean():.1%}")
-        print(f"  Minimum check-in rate: {checkin_rates.min():.1%}")
-        print(f"  Maximum check-in rate: {checkin_rates.max():.1%}")
+        print(f"\nFlight size validation (non-infant passengers):")
+        print(f"  Minimum passengers per flight: {checkins_per_flight.min()}")
+        print(f"  Maximum passengers per flight: {checkins_per_flight.max()}")
+        print(f"  Average passengers per flight: {checkins_per_flight.mean():.1f}")
+        print(f"  Flights with < {self.MIN_CHECKINS_PER_FLIGHT} passengers: {(checkins_per_flight < self.MIN_CHECKINS_PER_FLIGHT).sum()}")
         
-        print(f"\nSmall flight compliance (≤75 passengers):")
-        print(f"  Flights with 100% check-in rate: {sum(small_flight_compliance):,} of {len(small_flights):,}")
-        print(f"  Success rate: {small_flight_success_rate:.1%}")
+        # Validate minimum requirement
+        compliant_flights = (checkins_per_flight >= self.MIN_CHECKINS_PER_FLIGHT).sum()
+        total_flights = len(checkins_per_flight)
+        compliance_rate = compliant_flights / total_flights if total_flights > 0 else 0
         
-        if small_flight_success_rate < 1.0:
-            non_compliant = [pid for pid, compliant in zip(small_flights.index, small_flight_compliance) if not compliant]
-            print(f"  Non-compliant flights: {non_compliant}")
+        print(f"\nCOMPLIANCE CHECK:")
+        print(f"  Flights meeting minimum {self.MIN_CHECKINS_PER_FLIGHT}: {compliant_flights:,} of {total_flights:,}")
+        print(f"  Compliance rate: {compliance_rate:.1%}")
         
-        # Check seat conflicts
+        if compliance_rate < 1.0:
+            non_compliant = checkins_per_flight[checkins_per_flight < self.MIN_CHECKINS_PER_FLIGHT]
+            print(f"  Non-compliant flights: {list(non_compliant.index)}")
+        else:
+            print(f"  ✅ SUCCESS: All flights meet minimum requirement!")
+        
+        # Check for seat conflicts
         checked_in_with_seats = checkins_df[
             (checkins_df['checkin_status'] == 'checked_in') & 
             (checkins_df['seat_allocation'].notna()) &
@@ -518,61 +446,61 @@ class RealisticCheckInsGenerator:
         if len(conflicts) > 0:
             print(f"\nWARNING: {len(conflicts)} seat conflicts detected!")
         else:
-            print(f"\nSUCCESS: No seat conflicts detected!")
+            print(f"\n✅ SUCCESS: No seat conflicts detected!")
 
-def generate_realistic_checkins(target_year: int = 2021):
-    """Generate realistic check-ins with proper industry-standard rates."""
-    print(f"Starting realistic check-ins generation for {target_year}")
-    print("Key improvements:")
-    print("- Industry-standard check-in rates (85-98%)")
-    print("- 100% check-in rate for flights with ≤75 passengers")
-    print("- No more unrealistic low check-in rates")
-    print("-" * 50)
+def generate_minimum_75_checkins(target_year: int = 2021):
+    """Generate check-ins with minimum 75 passengers per flight."""
+    print(f"Starting MINIMUM 75 CHECK-INS generation for {target_year}")
+    print("=" * 60)
+    print("GUARANTEE: Every flight will have at least 75 checked-in passengers")
+    print("METHOD: Existing passengers + synthetic passengers as needed")
+    print("=" * 60)
     
     try:
-        generator = RealisticCheckInsGenerator(target_year=target_year)
+        generator = Minimum75CheckInsGenerator(target_year=target_year)
         checkins_df = generator.generate_checkins()
         
-        print(f"\nSuccessfully generated realistic check-ins for {target_year}!")
+        print(f"\n🎉 Successfully generated minimum 75 check-ins per flight for {target_year}!")
         return checkins_df
         
     except Exception as e:
-        print(f"Error generating check-ins: {str(e)}")
+        print(f"❌ Error generating check-ins: {str(e)}")
         raise
 
 if __name__ == "__main__":
+    # Set random seed
     seed_bytes = os.urandom(4)
     seed_int = int.from_bytes(seed_bytes, byteorder='big')
     random.seed(seed_int)
     np.random.seed(seed_int)
     
     TARGET_YEAR = 2021
-    checkins = generate_realistic_checkins(target_year=TARGET_YEAR)
+    checkins = generate_minimum_75_checkins(target_year=TARGET_YEAR)
     
     if not checkins.empty:
         print(f"\nSample check-ins:")
-        print(checkins.head())
+        print(checkins.head(10))
         
-        checked_in_by_flight = checkins[
-            (checkins['checkin_status'] == 'checked_in') & 
-            (checkins['passenger_type'] != 'infant')
-        ].groupby('planning_id').size()
-        
-        total_by_flight = checkins[
+        # Verify minimum requirement
+        non_infant_per_flight = checkins[
             checkins['passenger_type'] != 'infant'
         ].groupby('planning_id').size()
         
-        checkin_rates = checked_in_by_flight / total_by_flight
+        min_passengers = non_infant_per_flight.min()
+        max_passengers = non_infant_per_flight.max()
+        avg_passengers = non_infant_per_flight.mean()
         
-        # Get flight sizes
-        flight_sizes = checkins.groupby('planning_id')['total_flight_passengers'].first()
-        small_flights = flight_sizes[flight_sizes <= 75]
-        large_flights = flight_sizes[flight_sizes > 75]
+        print(f"\n📊 FINAL VALIDATION:")
+        print(f"   Minimum passengers per flight: {min_passengers}")
+        print(f"   Maximum passengers per flight: {max_passengers}")
+        print(f"   Average passengers per flight: {avg_passengers:.1f}")
+        print(f"   Total flights: {len(non_infant_per_flight):,}")
         
-        print(f"\nRealistic check-in rates achieved:")
-        print(f"Small flights (≤75 passengers): {len(small_flights):,} flights")
-        print(f"  All have 100% check-in rate: {(checkin_rates[small_flights.index] == 1.0).all()}")
-        print(f"Large flights (>75 passengers): {len(large_flights):,} flights")
-        print(f"  Flights with 85%+ check-in rate: {(checkin_rates[large_flights.index] >= 0.85).sum()} of {len(large_flights)}")
-        print(f"  Flights with 90%+ check-in rate: {(checkin_rates[large_flights.index] >= 0.90).sum()} of {len(large_flights)}")
-        print(f"  Flights with 95%+ check-in rate: {(checkin_rates[large_flights.index] >= 0.95).sum()} of {len(large_flights)}")
+        if min_passengers >= 75:
+            print(f"\n✅ SUCCESS: All flights have at least 75 passengers!")
+        else:
+            print(f"\n❌ FAILURE: Some flights have fewer than 75 passengers!")
+            problem_flights = non_infant_per_flight[non_infant_per_flight < 75]
+            print(f"   Problem flights: {len(problem_flights)}")
+            for flight_id, count in problem_flights.head().items():
+                print(f"     {flight_id}: {count} passengers")
