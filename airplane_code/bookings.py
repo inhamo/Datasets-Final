@@ -22,7 +22,10 @@ class RealisticAirlineBookingsGenerator:
         self.TARGET_YEAR = target_year
         
         try:
+            # Load flight schedules, ensuring planning_id is available
             self.flight_schedule_df = pd.read_parquet(f'airplane_data/flight_schedule_{target_year}.parquet')
+            if 'planning_id' not in self.flight_schedule_df.columns:
+                raise ValueError("planning_id missing from flight_schedule data")
             
             client_files = []
             for year in range(BASE_YEAR, target_year + 1):
@@ -127,13 +130,13 @@ class RealisticAirlineBookingsGenerator:
         print(f"- Flight dates: {self.flight_data['scheduled_departure'].min()} to {self.flight_data['scheduled_departure'].max()}")
 
     def _calculate_route_popularity(self):
-        """Calculate route popularity based on city pairs and add time-of-day factors."""
-        # Major city codes
-        major_cities = {'JNB', 'CPT', 'CDG', 'JFK', }
+        """Calculate route popularity with seasonal, time, and day factors."""
+        major_cities = {'JNB', 'CPT', 'CDG', 'JFK', 'FRA', 'LHR', 'DXB'}
         
         route_popularity = []
         time_popularity = []
         day_popularity = []
+        seasonal_popularity = []
         
         for _, flight in self.flight_data.iterrows():
             origin = flight.get('origin_city', '')
@@ -153,10 +156,8 @@ class RealisticAirlineBookingsGenerator:
             
             # Time popularity
             hour = departure_time.hour
-            if 6 <= hour <= 9:
+            if 6 <= hour <= 9 or 17 <= hour <= 20:  # Business traveler peak times
                 time_pop = 1.0
-            elif 17 <= hour <= 20:
-                time_pop = 0.9
             elif 10 <= hour <= 16:
                 time_pop = 0.7
             else:
@@ -168,20 +169,27 @@ class RealisticAirlineBookingsGenerator:
                 day_pop = 1.0
             elif weekday == 6:  # Sunday
                 day_pop = 0.85
-            elif weekday == 2:  # Wednesday
-                day_pop = 0.75
-            else:  # Saturday
+            else:  # Wednesday, Saturday
                 day_pop = 0.6
+            
+            # Seasonal popularity
+            month = departure_time.month
+            if month in [12, 1, 2, 6, 7, 8]:  # Peak travel seasons
+                season_pop = 1.0
+            else:
+                season_pop = 0.6
             
             route_popularity.append(route_pop)
             time_popularity.append(time_pop)
             day_popularity.append(day_pop)
+            seasonal_popularity.append(season_pop)
         
         self.flight_data['route_popularity'] = route_popularity
         self.flight_data['time_popularity'] = time_popularity
         self.flight_data['day_popularity'] = day_popularity
+        self.flight_data['seasonal_popularity'] = seasonal_popularity
         self.flight_data['overall_popularity'] = (
-            np.array(route_popularity) * np.array(time_popularity) * np.array(day_popularity)
+            np.array(route_popularity) * np.array(time_popularity) * np.array(day_popularity) * np.array(seasonal_popularity)
         )
 
     def _get_eligible_customers_for_flight(self, flight_departure_date):
@@ -189,17 +197,13 @@ class RealisticAirlineBookingsGenerator:
         Get customers who could realistically book this flight.
         Only includes customers registered at least 1 day before the flight.
         """
-        # Set the cutoff - customers must be registered at least 1 day before flight
         registration_cutoff = flight_departure_date - timedelta(days=1)
-        
-        # Filter customers who were registered before this cutoff
         eligible_customers = self.main_holders[
             self.main_holders['date_of_registration'] <= registration_cutoff
         ].copy()
-        
         return eligible_customers
 
-    def _generate_realistic_booking_date(self, flight_departure, customer_registration, popularity_factor=1.0):
+    def _generate_realistic_booking_date(self, flight_departure, customer_registration, popularity_factor=1.0, is_business_traveler=False):
         """
         Generate a realistic booking date that is ALWAYS after customer registration.
         
@@ -207,38 +211,32 @@ class RealisticAirlineBookingsGenerator:
             flight_departure: When the flight departs
             customer_registration: When the customer registered
             popularity_factor: Flight popularity (affects booking timing)
+            is_business_traveler: If True, books closer to departure
         """
-        # Ensure we have timezone-naive dates
         if hasattr(flight_departure, 'tz') and flight_departure.tz is not None:
             flight_departure = flight_departure.tz_localize(None)
         if hasattr(customer_registration, 'tz') and customer_registration.tz is not None:
             customer_registration = customer_registration.tz_localize(None)
         
-        # Booking window: from 1 day after registration to 2 hours before flight
         earliest_booking = customer_registration + timedelta(days=1)
         latest_booking = flight_departure - timedelta(hours=2)
         
-        # If the booking window is invalid (flight too soon after registration), skip
         if earliest_booking >= latest_booking:
             return None
         
-        # Calculate booking timing based on popularity
         total_hours = (latest_booking - earliest_booking).total_seconds() / 3600
         
-        if popularity_factor > 0.8:
-            # Popular flights: book earlier (weighted toward beginning of window)
+        if is_business_traveler:
+            booking_position = np.random.beta(5, 2)  # Skewed toward late booking
+        elif popularity_factor > 0.8:
             booking_position = np.random.beta(2, 5)  # Skewed toward early booking
         elif popularity_factor > 0.6:
-            # Medium popularity: more balanced
-            booking_position = np.random.beta(3, 3)  # More balanced
+            booking_position = np.random.beta(3, 3)  # Balanced
         else:
-            # Low popularity: book later (weighted toward end of window)
             booking_position = np.random.beta(5, 2)  # Skewed toward late booking
         
-        # Calculate the actual booking date
         hours_from_start = total_hours * booking_position
         booking_date = earliest_booking + timedelta(hours=hours_from_start)
-        
         return booking_date
 
     def _determine_group_size(self, remaining_capacity, popularity_factor, is_company_traveler):
@@ -246,17 +244,13 @@ class RealisticAirlineBookingsGenerator:
         if remaining_capacity <= 0:
             return 0, 0, 0
         
-        # Adjust probabilities based on popularity, capacity, and company status
         if is_company_traveler and remaining_capacity > 50:
-            # Company travelers: prefer larger corporate groups
             passenger_probs = [0.10, 0.10, 0.10, 0.10, 0.15, 0.15, 0.15, 0.15, 0.10, 0.05]
             passenger_types = [(1,0,0), (2,0,0), (4,0,0), (6,0,0), (8,0,0), (12,0,0), (15,0,0), (18,0,0), (25,0,0), (30,0,0)]
         elif popularity_factor > 0.8 and remaining_capacity > 50:
-            # Popular flights: more likely to have business groups
             passenger_probs = [0.35, 0.15, 0.10, 0.08, 0.08, 0.07, 0.06, 0.05, 0.06]
             passenger_types = [(1,0,0), (2,0,0), (2,1,0), (2,2,0), (3,0,0), (4,0,0), (6,0,0), (8,0,0), (12,0,0)]
         elif remaining_capacity < 10:
-            # Fill remaining seats with small groups
             max_passengers = min(remaining_capacity, 4)
             if max_passengers == 1:
                 return 1, 0, 0
@@ -267,34 +261,30 @@ class RealisticAirlineBookingsGenerator:
             else:
                 return random.choice([(4,0,0), (2,2,0), (2,1,1)])
         else:
-            # Standard distribution
             passenger_probs = [0.45, 0.18, 0.08, 0.06, 0.04, 0.04, 0.04, 0.03, 0.03, 0.02, 0.03]
             passenger_types = [
                 (1, 0, 0), (2, 0, 0), (2, 1, 0), (2, 2, 0), (2, 1, 1),
                 (3, 0, 0), (4, 0, 0), (8, 0, 0), (12, 0, 0), (18, 0, 0), (25, 0, 0)
             ]
         
-        # Filter valid types
         valid_types = [(adults, children, infants) for adults, children, infants in passenger_types 
                       if adults + children <= remaining_capacity]
         
         if not valid_types:
             return 1, 0, 0
         
-        # Adjust probabilities
         valid_probs = passenger_probs[:len(valid_types)]
         valid_probs = np.array(valid_probs) / sum(valid_probs)
         
         choice = np.random.choice(len(valid_types), p=valid_probs)
         return valid_types[choice]
 
-    def _simple_seat_assignment(self, num_seats, is_group=False, group_type='individual', is_company_traveler=False):
-        """Generate seat assignments, prioritizing consecutive seating for company travelers."""
+    def _simple_seat_assignment(self, num_seats, is_group=False, is_company_traveler=False):
+        """Generate seat assignments, prioritizing consecutive seating for groups and company travelers."""
         max_row = 30
         seat_letters = ['A', 'B', 'C', 'D', 'E', 'F']
         
         if (is_group or is_company_traveler) and num_seats >= 4:
-            # For groups or company travelers, prioritize consecutive seating
             start_row = np.random.randint(5, 20)
             seats = []
             current_row = start_row
@@ -309,163 +299,371 @@ class RealisticAirlineBookingsGenerator:
             
             return seats[:num_seats]
         else:
-            # Random assignment for non-groups or small groups
             rows = np.random.poisson(lam=15, size=num_seats) % max_row + 1
             letters = np.random.choice(seat_letters, size=num_seats)
             return [f"{r}{l}" for r, l in zip(rows, letters)]
 
     def generate_bookings(self):
-        """Generate bookings with absolute guarantee that booking_date > registration_date."""
-        print(f"Generating bookings for {self.TARGET_YEAR} with strict date validation")
+        """Generate bookings with absolute guarantee that booking_date > registration_date and minimum 50 passengers per planning_id."""
+        print(f"Generating bookings for {self.TARGET_YEAR} with strict date validation and minimum 50 passengers per flight")
         
         flight_data = self.flight_data.copy()
         
-        # Calculate target bookings (minimum 75 per flight)
-        base_load_factors = stats.beta.rvs(a=5, b=2, loc=0.6, scale=0.4, size=len(flight_data))
+        # Calculate target bookings with minimum 50 passengers
+        base_load_factors = stats.beta.rvs(a=5, b=2, loc=0.4, scale=0.6, size=len(flight_data))
         adjusted_load_factors = base_load_factors * flight_data['overall_popularity']
         flight_data['target_bookings'] = (
             flight_data['aircraft_capacity'] * adjusted_load_factors
         ).astype(int)
         
-        # Enforce minimum 75 passengers
-        flight_data['target_bookings'] = np.maximum(flight_data['target_bookings'], 75)
+        flight_data['target_bookings'] = np.maximum(flight_data['target_bookings'], 50)
         flight_data['target_bookings'] = np.minimum(flight_data['target_bookings'], flight_data['aircraft_capacity'])
         
         bookings = []
         booking_counter = 1
         
+        # Track passengers per segment for connecting flights
+        current_segments = {}
+        for _, flight in flight_data.iterrows():
+            pid = flight['planning_id']
+            if flight.get('is_connecting', False):
+                current_segments[pid] = {'segment1': 0, 'segment2': 0}
+            else:
+                current_segments[pid] = {'full': 0}
+        
+        target_passengers = dict(zip(flight_data['planning_id'], flight_data['target_bookings']))
+        
         print("Processing flights with strict date validation...")
         
         for _, flight in tqdm(flight_data.iterrows(), total=len(flight_data), desc="Generating bookings"):
-            target_bookings = flight['target_bookings']
-            current_capacity = 0
+            pid = flight['planning_id']
+            target = target_passengers[pid]
+            is_connecting = flight.get('is_connecting', False)
+            current_dict = current_segments[pid]
+            aircraft_capacity = flight['aircraft_capacity']
             
-            # Get eligible customers for this flight (registered at least 1 day before flight)
             eligible_customers = self._get_eligible_customers_for_flight(flight['scheduled_departure'])
             
             if eligible_customers.empty:
-                print(f"Warning: No eligible customers for flight {flight['planning_id']} on {flight['scheduled_departure']}")
+                print(f"Warning: No eligible customers for flight {pid} on {flight['scheduled_departure']}")
                 continue
             
-            # Generate bookings until we reach target or run out of attempts
-            attempt_count = 0
-            max_attempts = target_bookings * 2
+            # Prefer local customers
+            eligible_customers['weight'] = np.where(eligible_customers['city'] == flight.get('origin_city', ''), 10, 1)
             
-            while current_capacity < target_bookings and attempt_count < max_attempts:
+            attempt_count = 0
+            max_attempts = target * 2
+            
+            while attempt_count < max_attempts:
+                total_passengers = sum(current_dict.values())
+                if is_connecting:
+                    if max(current_dict['segment1'], current_dict['segment2']) >= target:
+                        break
+                else:
+                    if current_dict['full'] >= target:
+                        break
+                
                 attempt_count += 1
                 
-                # Select random customer from eligible pool
-                customer = eligible_customers.sample(n=1).iloc[0]
-                
-                # Check if customer is a company traveler
+                customer = eligible_customers.sample(n=1, weights='weight').iloc[0]
                 is_company_traveler = pd.notna(customer['partner_company'])
                 
-                # Generate booking date that's ALWAYS after registration
+                # Determine booking channel
+                booking_channel = np.random.choice(['mobile', 'website', 'agent'], p=[0.6, 0.3, 0.1])
+                
                 booking_date = self._generate_realistic_booking_date(
                     flight['scheduled_departure'],
                     customer['date_of_registration'],
-                    flight['overall_popularity']
+                    flight['overall_popularity'],
+                    is_business_traveler=is_company_traveler
                 )
                 
-                # If no valid booking date, skip this attempt
                 if booking_date is None:
                     continue
                 
-                # Determine group size
-                remaining_capacity = target_bookings - current_capacity
+                days_before = (flight['scheduled_departure'] - booking_date).days
+                
                 num_adults, num_children, num_infants = self._determine_group_size(
-                    remaining_capacity, flight['overall_popularity'], is_company_traveler
+                    aircraft_capacity - total_passengers, flight['overall_popularity'], is_company_traveler
                 )
                 
-                total_passengers = num_adults + num_children
-                if total_passengers == 0 or current_capacity + total_passengers > flight['aircraft_capacity']:
+                total_passengers_booking = num_adults + num_children
+                if total_passengers_booking == 0:
                     continue
                 
-                # Generate booking details
+                # Handle connecting flights
+                if is_connecting:
+                    segment_choice = np.random.choice(['full', 'first', 'second'], p=[0.7, 0.15, 0.15])
+                    add_to_seg1 = segment_choice in ['full', 'first']
+                    add_to_seg2 = segment_choice in ['full', 'second']
+                    
+                    if add_to_seg1 and current_dict['segment1'] + total_passengers_booking > aircraft_capacity:
+                        continue
+                    if add_to_seg2 and current_dict['segment2'] + total_passengers_booking > aircraft_capacity:
+                        continue
+                else:
+                    segment_choice = 'direct'
+                    if current_dict['full'] + total_passengers_booking > aircraft_capacity:
+                        continue
+                
                 is_group = num_adults >= 8
-                group_types = (
-                    ['corporate_event'] if is_company_traveler and is_group else
-                    ['individual', 'family', 'friends', 'corporate_event', 'sports_team', 'tour_group']
-                )
-                group_probs = (
-                    [1.0] if is_company_traveler and is_group else
-                    [0.6, 0.2, 0.1, 0.05, 0.03, 0.02]
-                )
-                group_type = np.random.choice(group_types, p=group_probs)
                 
-                trip_type = 'return' if random.random() < 0.75 else 'one-way'
-                booking_class = 'business' if (is_company_traveler and random.random() < 0.5) else (
-                    'business' if random.random() < (0.15 if is_group else 0.05) else 'economy'
+                # Trip type with multi-city option
+                trip_type = np.random.choice(
+                    ['one-way', 'return', 'multi-city'],
+                    p=[0.5, 0.4, 0.1]
                 )
                 
-                # Price calculation
+                # Booking class and fare type
+                booking_class = 'Business' if (is_company_traveler and random.random() < 0.5) else (
+                    'Business' if random.random() < (0.15 if is_group else 0.05) else 'Economy'
+                )
+                
+                if booking_class == 'Business':
+                    fare_type = np.random.choice(['Business Saver', 'Business Flex'], p=[0.6, 0.4])
+                else:
+                    fare_type = np.random.choice(['Basic', 'Standard Fare', 'Flex'], p=[0.3, 0.5, 0.2])
+                
+                # Dynamic pricing
                 base_price = flight.get('final_price_zar', 800)
                 price_multiplier = np.random.normal(1.3, 0.25)
-                if booking_class == 'business':
+                if booking_class == 'Business':
                     price_multiplier *= 3.0
                 if is_group and num_adults >= 12:
                     price_multiplier *= 0.9
                 if is_company_traveler:
-                    price_multiplier *= 0.9  # Corporate discount
+                    price_multiplier *= 0.9
+                if days_before > 60:
+                    price_multiplier *= 0.8
+                elif days_before < 14:
+                    price_multiplier *= 1.3
+                elif days_before < 3:
+                    price_multiplier *= 1.6
+                if booking_channel == 'mobile':
+                    price_multiplier *= 0.95  # Mobile promotion
+                if is_connecting and segment_choice != 'full':
+                    price_multiplier *= 0.6
                 
                 price_per_ticket = max(base_price * price_multiplier, 200)
                 
-                # Booking status
-                status_probs = [0.87, 0.08, 0.04, 0.01]
-                status = np.random.choice(['confirmed', 'cancelled', 'rescheduled', 'on-hold'], p=status_probs)
+                # Booking status with realistic errors
+                status_probs = [0.85, 0.08, 0.04, 0.02, 0.01]
+                status = np.random.choice(
+                    ['confirmed', 'cancelled', 'rescheduled', 'on-hold', 'payment_failed'],
+                    p=status_probs
+                )
                 
-                # Generate addons
+                # Addons
                 addons = {
                     'is_priority': random.random() < (0.35 if is_group else 0.18),
-                    'is_assisted': random.random() < (0.08 if group_type == 'tour_group' else 0.025),
+                    'is_assisted': random.random() < 0.025,
                     'is_special_needs': random.random() < 0.015,
-                    'is_lounge_access': random.random() < (0.50 if is_company_traveler else (0.25 if group_type == 'corporate_event' else 0.08)),
-                    'is_cancellation_refundable': random.random() < 0.45,
+                    'is_lounge_access': random.random() < (0.50 if is_company_traveler else 0.08),
+                    'is_cancellation_refundable': fare_type in ['Flex', 'Business Flex'],
                     'is_travel_protection': random.random() < (0.50 if is_company_traveler else 0.28),
                     'is_cheap_hotel_accommodation': random.random() < 0.06,
                     'is_car_rental': random.random() < 0.05
                 }
                 
-                # Seat assignments
-                seat_assignments = self._simple_seat_assignment(total_passengers, is_group, group_type, is_company_traveler)
-                seat_request = ','.join(seat_assignments) if len(seat_assignments) > 1 else seat_assignments[0]
+                # Seat assignment (optional, less likely for mobile)
+                seat_request = ''
+                if booking_channel == 'mobile':
+                    assign_seats = random.random() < 0.3  # 30% chance for mobile
+                else:
+                    assign_seats = random.random() < 0.8  # 80% chance for website/agent
+                
+                if assign_seats:
+                    seat_assignments = self._simple_seat_assignment(total_passengers_booking, is_group, is_company_traveler)
+                    seat_request = ','.join(seat_assignments) if len(seat_assignments) > 1 else seat_assignments[0] if seat_assignments else ''
+                
+                # Determine board and deboard airports
+                origin_airport = flight.get('origin_airport', '')
+                destination_airport = flight.get('destination_airport', '')
+                intermediate_stop = flight.get('intermediate_stop', '')
+                
+                if is_connecting:
+                    if segment_choice == 'full':
+                        board_airport = origin_airport
+                        deboard_airport = destination_airport
+                    elif segment_choice == 'first':
+                        board_airport = origin_airport
+                        deboard_airport = intermediate_stop
+                    else:  # second
+                        board_airport = intermediate_stop
+                        deboard_airport = destination_airport
+                else:
+                    board_airport = origin_airport
+                    deboard_airport = destination_airport
                 
                 # Create booking record
                 booking = {
                     'booking_id': f"BK{self.TARGET_YEAR}{booking_counter:06d}",
                     'client_id': customer['client_id'],
-                    'planning_id': flight['planning_id'],
+                    'planning_id': pid,
                     'booking_date': booking_date,
                     'trip_type': trip_type,
                     'num_adults': num_adults,
                     'num_children': num_children,
                     'num_infants': num_infants,
                     'booking_class': booking_class,
+                    'fare_type': fare_type,
                     'booking_status': status,
-                    'group_booking_type': group_type,
                     'is_charter': random.random() < 0.005 if is_group else False,
                     'seat_request': seat_request,
                     'price_per_ticket': round(price_per_ticket, 2),
+                    'board_airport': board_airport,
+                    'deboard_airport': deboard_airport,
+                    'booking_channel': booking_channel,
                     **addons
                 }
                 
                 bookings.append(booking)
-                current_capacity += total_passengers
                 booking_counter += 1
+                
+                # Update passenger counts
+                if is_connecting:
+                    if add_to_seg1:
+                        current_dict['segment1'] += total_passengers_booking
+                    if add_to_seg2:
+                        current_dict['segment2'] += total_passengers_booking
+                else:
+                    current_dict['full'] += total_passengers_booking
         
-        # Create DataFrame with only specified columns
         bookings_df = pd.DataFrame(bookings)
         columns_to_keep = [
             'booking_id', 'client_id', 'planning_id', 'booking_date', 'trip_type',
-            'num_adults', 'num_children', 'num_infants', 'booking_class', 'booking_status',
-            'group_booking_type', 'is_charter', 'seat_request', 'price_per_ticket',
+            'num_adults', 'num_children', 'num_infants', 'booking_class', 'fare_type',
+            'booking_status', 'is_charter', 'seat_request', 'price_per_ticket',
+            'board_airport', 'deboard_airport', 'booking_channel',
             'is_priority', 'is_assisted', 'is_special_needs', 'is_lounge_access',
             'is_cancellation_refundable', 'is_travel_protection', 'is_cheap_hotel_accommodation',
             'is_car_rental'
         ]
         bookings_df = bookings_df[columns_to_keep]
         
-        # FINAL VALIDATION
+        # Ensure minimum 50 passengers per planning_id
+        passengers_per_flight = bookings_df.groupby('planning_id').apply(
+            lambda x: (x['num_adults'] + x['num_children']).sum()
+        )
+        underbooked_flights = passengers_per_flight[passengers_per_flight < 50]
+        if not underbooked_flights.empty:
+            print(f"Warning: {len(underbooked_flights)} flights have less than 50 passengers")
+            for pid in underbooked_flights.index:
+                current_passengers = passengers_per_flight.get(pid, 0)
+                additional_needed = 50 - current_passengers
+                eligible_customers = self._get_eligible_customers_for_flight(
+                    flight_data[flight_data['planning_id'] == pid]['scheduled_departure'].iloc[0]
+                )
+                
+                while additional_needed > 0 and not eligible_customers.empty:
+                    customer = eligible_customers.sample(n=1, weights='weight').iloc[0]
+                    is_company_traveler = pd.notna(customer['partner_company'])
+                    booking_date = self._generate_realistic_booking_date(
+                        flight_data[flight_data['planning_id'] == pid]['scheduled_departure'].iloc[0],
+                        customer['date_of_registration'],
+                        flight_data[flight_data['planning_id'] == pid]['overall_popularity'].iloc[0],
+                        is_business_traveler=is_company_traveler
+                    )
+                    if booking_date is None:
+                        continue
+                    
+                    days_before = (flight_data[flight_data['planning_id'] == pid]['scheduled_departure'].iloc[0] - booking_date).days
+                    num_adults, num_children, num_infants = self._determine_group_size(
+                        additional_needed, flight_data[flight_data['planning_id'] == pid]['overall_popularity'].iloc[0], is_company_traveler
+                    )
+                    total_passengers_booking = num_adults + num_children
+                    if total_passengers_booking == 0 or total_passengers_booking + current_dict.get('full', 0) > flight_data[flight_data['planning_id'] == pid]['aircraft_capacity'].iloc[0]:
+                        continue
+                    
+                    is_group = num_adults >= 8
+                    trip_type = np.random.choice(['one-way', 'return', 'multi-city'], p=[0.5, 0.4, 0.1])
+                    booking_class = 'Business' if (is_company_traveler and random.random() < 0.5) else (
+                        'Business' if random.random() < (0.15 if is_group else 0.05) else 'Economy'
+                    )
+                    fare_type = np.random.choice(['Business Saver', 'Business Flex'], p=[0.6, 0.4]) if booking_class == 'Business' else np.random.choice(['Basic', 'Standard Fare', 'Flex'], p=[0.3, 0.5, 0.2])
+                    booking_channel = np.random.choice(['mobile', 'website', 'agent'], p=[0.6, 0.3, 0.1])
+                    
+                    base_price = flight_data[flight_data['planning_id'] == pid].get('final_price_zar', 800).iloc[0]
+                    price_multiplier = np.random.normal(1.3, 0.25)
+                    if booking_class == 'Business':
+                        price_multiplier *= 3.0
+                    if is_group and num_adults >= 12:
+                        price_multiplier *= 0.9
+                    if is_company_traveler:
+                        price_multiplier *= 0.9
+                    if days_before > 60:
+                        price_multiplier *= 0.8
+                    elif days_before < 14:
+                        price_multiplier *= 1.3
+                    elif days_before < 3:
+                        price_multiplier *= 1.6
+                    if booking_channel == 'mobile':
+                        price_multiplier *= 0.95
+                    
+                    price_per_ticket = max(base_price * price_multiplier, 200)
+                    status = np.random.choice(['confirmed', 'cancelled', 'rescheduled', 'on-hold', 'payment_failed'], p=[0.85, 0.08, 0.04, 0.02, 0.01])
+                    addons = {
+                        'is_priority': random.random() < (0.35 if is_group else 0.18),
+                        'is_assisted': random.random() < 0.025,
+                        'is_special_needs': random.random() < 0.015,
+                        'is_lounge_access': random.random() < (0.50 if is_company_traveler else 0.08),
+                        'is_cancellation_refundable': fare_type in ['Flex', 'Business Flex'],
+                        'is_travel_protection': random.random() < (0.50 if is_company_traveler else 0.28),
+                        'is_cheap_hotel_accommodation': random.random() < 0.06,
+                        'is_car_rental': random.random() < 0.05
+                    }
+                    
+                    seat_request = ''
+                    if booking_channel == 'mobile':
+                        assign_seats = random.random() < 0.3
+                    else:
+                        assign_seats = random.random() < 0.8
+                    if assign_seats:
+                        seat_assignments = self._simple_seat_assignment(total_passengers_booking, is_group, is_company_traveler)
+                        seat_request = ','.join(seat_assignments) if len(seat_assignments) > 1 else seat_assignments[0] if seat_assignments else ''
+                    
+                    board_airport = flight_data[flight_data['planning_id'] == pid].get('origin_airport', '').iloc[0]
+                    deboard_airport = flight_data[flight_data['planning_id'] == pid].get('destination_airport', '').iloc[0]
+                    
+                    booking = {
+                        'booking_id': f"BK{self.TARGET_YEAR}{booking_counter:06d}",
+                        'client_id': customer['client_id'],
+                        'planning_id': pid,
+                        'booking_date': booking_date,
+                        'trip_type': trip_type,
+                        'num_adults': num_adults,
+                        'num_children': num_children,
+                        'num_infants': num_infants,
+                        'booking_class': booking_class,
+                        'fare_type': fare_type,
+                        'booking_status': status,
+                        'is_charter': random.random() < 0.005 if is_group else False,
+                        'seat_request': seat_request,
+                        'price_per_ticket': round(price_per_ticket, 2),
+                        'board_airport': board_airport,
+                        'deboard_airport': deboard_airport,
+                        'booking_channel': booking_channel,
+                        **addons
+                    }
+                    
+                    bookings.append(booking)
+                    booking_counter += 1
+                    additional_needed -= total_passengers_booking
+                    current_dict['full'] = current_dict.get('full', 0) + total_passengers_booking
+        
+        bookings_df = pd.DataFrame(bookings)
+        columns_to_keep = [
+            'booking_id', 'client_id', 'planning_id', 'booking_date', 'trip_type',
+            'num_adults', 'num_children', 'num_infants', 'booking_class', 'fare_type',
+            'booking_status', 'is_charter', 'seat_request', 'price_per_ticket',
+            'board_airport', 'deboard_airport', 'booking_channel',
+            'is_priority', 'is_assisted', 'is_special_needs', 'is_lounge_access',
+            'is_cancellation_refundable', 'is_travel_protection', 'is_cheap_hotel_accommodation',
+            'is_car_rental'
+        ]
+        bookings_df = bookings_df[columns_to_keep]
+        
+        # Final validation
         if not bookings_df.empty:
             validation_df = bookings_df.merge(
                 self.main_holders[['client_id', 'date_of_registration']], 
@@ -478,27 +676,25 @@ class RealisticAirlineBookingsGenerator:
             
             if len(invalid_bookings) > 0:
                 print(f"CRITICAL ERROR: Found {len(invalid_bookings)} invalid bookings!")
-                print("This should never happen with the new logic.")
                 raise ValueError("Invalid booking dates found - check the booking generation logic")
             else:
                 print("SUCCESS: All booking dates are after customer registration dates")
         
-        # Statistics
+        # Verify minimum 50 passengers
         passengers_per_flight = bookings_df.groupby('planning_id').apply(
             lambda x: (x['num_adults'] + x['num_children']).sum()
         )
+        underbooked_flights = passengers_per_flight[passengers_per_flight < 50]
+        if not underbooked_flights.empty:
+            print(f"ERROR: {len(underbooked_flights)} flights still have less than 50 passengers after additional bookings")
+        else:
+            print("SUCCESS: All flights have at least 50 passengers")
         
         print(f"\n=== BOOKING GENERATION COMPLETE ===")
         print(f"Total bookings: {len(bookings_df):,}")
         print(f"Unique customers: {bookings_df['client_id'].nunique():,}")
         print(f"Unique flights: {bookings_df['planning_id'].nunique():,}")
         print(f"Average passengers per flight: {passengers_per_flight.mean():.1f}")
-        
-        underbooked_flights = passengers_per_flight[passengers_per_flight < 75]
-        if not underbooked_flights.empty:
-            print(f"Flights with <75 passengers: {len(underbooked_flights)}")
-        else:
-            print("SUCCESS: All flights have at least 75 passengers")
         
         return bookings_df
         
@@ -514,7 +710,7 @@ class RealisticAirlineBookingsGenerator:
 
 def generate_realistic_airline_bookings(target_year=BASE_YEAR, save_file=True):
     """
-    Generate airline bookings with absolute guarantee that booking_date > registration_date.
+    Generate airline bookings with absolute guarantee that booking_date > registration_date and minimum 50 passengers per flight.
     
     Args:
         target_year (int): Year to generate bookings for
@@ -524,7 +720,7 @@ def generate_realistic_airline_bookings(target_year=BASE_YEAR, save_file=True):
         pd.DataFrame: Generated bookings with valid dates
     """
     print(f"Starting FIXED airline bookings generation for {target_year}")
-    print("Key Fix: Booking dates are GUARANTEED to be after registration dates")
+    print("Key Fix: Booking dates are GUARANTEED to be after registration dates, minimum 50 passengers per flight")
     print("-" * 70)
     
     try:
@@ -543,7 +739,6 @@ def generate_realistic_airline_bookings(target_year=BASE_YEAR, save_file=True):
         raise
 
 if __name__ == "__main__":
-    # Set random seed for reproducibility
     seed_bytes = os.urandom(4)
     seed_int = int.from_bytes(seed_bytes, byteorder='big')
     random.seed(seed_int)
@@ -557,7 +752,7 @@ if __name__ == "__main__":
     
     if not bookings.empty:
         print("\nSample bookings:")
-        print(bookings.head())
+        print(bookings[['booking_id', 'client_id', 'planning_id', 'booking_date', 'trip_type', 'num_adults', 'num_children']].head())
         
         print(f"\nFinal validation:")
         print(f"- Date range: {bookings['booking_date'].min()} to {bookings['booking_date'].max()}")
