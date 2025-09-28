@@ -10,16 +10,16 @@ import warnings
 import os
 warnings.filterwarnings('ignore')
 
-class Minimum75CheckInsGenerator:
+class Minimum50CheckInsGenerator:
     def __init__(self, target_year: int = 2021):
         """
-        Initialize generator that ensures MINIMUM 75 check-ins per flight.
+        Initialize generator that ensures MINIMUM 50 check-ins per flight.
         
         Args:
             target_year (int): Year to generate check-ins for
         """
         self.TARGET_YEAR = target_year
-        self.MIN_CHECKINS_PER_FLIGHT = 75
+        self.MIN_CHECKINS_PER_FLIGHT = 50
         self.DOMESTIC_AIRPORTS = {'JNB', 'CPT', 'DBN', 'PLZ', 'ELS', 'GRJ'}
         
         # Load data
@@ -119,7 +119,7 @@ class Minimum75CheckInsGenerator:
         """Determine if a flight is domestic."""
         return origin_airport in self.DOMESTIC_AIRPORTS and destination_airport in self.DOMESTIC_AIRPORTS
 
-    def _create_expanded_seat_map(self, aircraft_type: str, min_capacity: int = 75) -> Dict[str, bool]:
+    def _create_expanded_seat_map(self, aircraft_type: str, min_capacity: int = 50) -> Dict[str, bool]:
         """Create seat map with enough seats for minimum passengers."""
         config = self.seat_configs.get(aircraft_type, self.seat_configs['default'])
         
@@ -143,6 +143,15 @@ class Minimum75CheckInsGenerator:
             blocked = random.sample(available_seats, blocked_count)
             for seat in blocked:
                 seat_map[seat] = False
+        
+        # Inject operational seat blocks
+        if random.random() < 0.05:  # 5% chance of additional blocked seats for maintenance
+            maintenance_blocked = random.randint(1, 5)
+            available_seats = [seat for seat, avail in seat_map.items() if avail]
+            if available_seats:
+                blocked = random.sample(available_seats, min(maintenance_blocked, len(available_seats)))
+                for seat in blocked:
+                    seat_map[seat] = False
         
         return seat_map
 
@@ -177,6 +186,14 @@ class Minimum75CheckInsGenerator:
         
         seat = available_seats[0]
         seat_map[seat] = False
+        
+        # Inject seat assignment conflicts
+        if random.random() < 0.02:  # 2% chance
+            # Assign a seat that's already taken
+            taken_seats = [s for s, avail in seat_map.items() if not avail]
+            if taken_seats:
+                seat = random.choice(taken_seats)
+        
         return seat
 
     def _generate_realistic_checkin_time(self, scheduled_departure: datetime, is_domestic: bool, is_synthetic: bool = False) -> datetime:
@@ -204,6 +221,19 @@ class Minimum75CheckInsGenerator:
         if (scheduled_departure - checkin_time) < gate_deadline:
             return None  # Cannot board in time
         
+        # Inject weather-related delays
+        if scheduled_departure.month in [6, 7, 8] and random.random() < 0.1:  # Winter weather
+            checkin_time = checkin_time - timedelta(hours=random.randint(2, 8))
+        
+        # Holiday chaos
+        if scheduled_departure.month == 12 and scheduled_departure.day > 20:
+            if random.random() < 0.2:  # 20% chance during holidays
+                checkin_time = checkin_time + timedelta(minutes=random.randint(15, 60))
+        
+        # Strike delays
+        if random.random() < 0.005:  # 0.5% chance
+            checkin_time = checkin_time + timedelta(hours=random.randint(2, 12))
+        
         return checkin_time
 
     def _assign_luggage(self, passenger_type: str) -> Tuple[float, float]:
@@ -222,6 +252,10 @@ class Minimum75CheckInsGenerator:
             weight *= 0.4
         elif random.random() < 0.10:
             weight = max_weight * random.uniform(0.85, 0.98)
+        
+        # Baggage weight discrepancies
+        if random.random() < 0.06:  # 6% chance
+            weight = weight * random.uniform(0.8, 1.3)
         
         return round(weight, 2), max_weight
 
@@ -261,13 +295,29 @@ class Minimum75CheckInsGenerator:
         passenger_surname = passenger_name.split()[-1] if passenger_name else ''
         return passenger_surname != parent_surname
 
+    def _introduce_typo(self, name: str) -> str:
+        """Introduce a realistic typo in name."""
+        if random.random() < 0.5:
+            # Swap two letters
+            name_list = list(name)
+            i = random.randint(0, len(name_list)-2)
+            name_list[i], name_list[i+1] = name_list[i+1], name_list[i]
+            return ''.join(name_list)
+        else:
+            # Replace a letter
+            name_list = list(name)
+            i = random.randint(0, len(name_list)-1)
+            if name_list[i].isalpha():
+                name_list[i] = random.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
+            return ''.join(name_list)
+
     def generate_checkins(self):
-        """Generate check-ins ensuring minimum 75 per flight."""
+        """Generate check-ins ensuring minimum 50 per flight."""
         print(f"Generating check-ins with MINIMUM {self.MIN_CHECKINS_PER_FLIGHT} per flight for {self.TARGET_YEAR}")
         print("Strategy:")
         print("- Exclude cancelled bookings, handle rescheduled/on-hold")
-        print("- Enforce check-in deadlines: 40 min (domestic), 60 min (international)")
-        print("- Generate synthetic passengers upfront to ensure minimum 75")
+        print("- Enforce check-in deadlines: 40 min (domestic), 60 min (international) before departure")
+        print("- Generate synthetic passengers upfront to ensure minimum 50")
         print("- Expand aircraft capacity as needed")
         print("- Children take parent's surname, affidavit if surnames differ")
         print("- Same booking passengers check-in together with 1-3 min variation")
@@ -279,6 +329,7 @@ class Minimum75CheckInsGenerator:
         checkin_counter = 1
         flight_seat_maps = {}
         flight_gates = {}
+        existing_checkins = {}  # To track existing check-ins for duplicates
         
         for planning_id in tqdm(self.unique_flights, desc="Processing flights"):
             flight_bookings = self.checkin_data[self.checkin_data['planning_id'] == planning_id]
@@ -483,6 +534,145 @@ class Minimum75CheckInsGenerator:
                     'declared_item': declared_item
                 }
                 
+                # Inject system and technical errors
+                # 1. Check-in system downtime causing late check-ins
+                if random.random() < 0.02:  # 2% chance
+                    checkin['checkin_time'] = flight_info['scheduled_departure'] - timedelta(minutes=random.randint(15, 35))
+                    checkin['checkin_channel'] = "counter"  # Forced to use counter due to system issues
+                
+                # 2. Duplicate check-in records from system glitches
+                if random.random() < 0.015:  # 1.5% chance
+                    duplicate_checkin = checkin.copy()
+                    duplicate_checkin['checkin_id'] = f"CI{self.TARGET_YEAR}{checkin_counter + 999999:06d}"
+                    duplicate_checkin['checkin_time'] = checkin['checkin_time'] + timedelta(minutes=random.randint(1, 15))
+                    checkins.append(duplicate_checkin)
+                
+                # 3. Wrong flight assignments from barcode scanning errors
+                if random.random() < 0.01:  # 1% chance
+                    wrong_planning_ids = [p for p in self.unique_flights if p != planning_id]
+                    if wrong_planning_ids:
+                        checkin['planning_id'] = random.choice(wrong_planning_ids)
+                
+                # 4. Seat assignment conflicts from concurrent bookings
+                if random.random() < 0.02:  # 2% chance
+                    # Two passengers assigned same seat
+                    existing_seats = [c['seat_allocation'] for c in checkins if c.get('planning_id') == planning_id and c['seat_allocation'] != 'Lap']
+                    if existing_seats:
+                        checkin['seat_allocation'] = random.choice(existing_seats)
+                
+                # Inject operational reality errors
+                # 1. Gate changes not reflected in check-in data
+                if random.random() < 0.08:  # 8% chance of gate change
+                    old_gate = flight_gates[planning_id]
+                    new_gate = self._generate_gate(passenger['origin_airport'])
+                    if random.random() < 0.3:
+                        checkin['gate_number'] = old_gate
+                    else:
+                        checkin['gate_number'] = new_gate
+                
+                # 2. Aircraft swaps causing capacity mismatches
+                if random.random() < 0.03:  # 3% chance
+                    if random.random() < 0.4:  # 40% of affected passengers don't get seats
+                        checkin['seat_allocation'] = "WAITLIST"
+                        checkin['checkin_status'] = "waitlisted"
+                
+                # 3. Weight restrictions forcing passenger removal
+                if random.random() < 0.005:  # 0.5% chance
+                    checkin['checkin_status'] = "denied_weight"
+                    checkin['seat_allocation'] = None
+                
+                # 4. Last-minute crew requirements taking passenger seats
+                if random.random() < 0.01:  # 1% chance
+                    checkin['seat_allocation'] = "CREW_PRIORITY"
+                    checkin['checkin_status'] = "bumped"
+                
+                # Inject customer service process errors
+                # 1. Incorrect passenger name from typos or system errors
+                if random.random() < 0.04:  # 4% chance
+                    name_parts = checkin['passenger_name'].split()
+                    if len(name_parts) > 1:
+                        if random.random() < 0.5:
+                            checkin['passenger_name'] = f"{name_parts[-1]} {name_parts[0]}"
+                        else:
+                            checkin['passenger_name'] = self._introduce_typo(checkin['passenger_name'])
+                
+                # 2. Missing special service requests
+                if random.random() < 0.03:  # 3% chance
+                    checkin['special_assistance'] = "WHEELCHAIR"
+                    # But seat allocation doesn't reflect aisle requirement
+                    if checkin['seat_allocation'] and 'A' not in checkin['seat_allocation'] and 'F' not in checkin['seat_allocation']:
+                        pass  # Should be aisle seat but isn't
+                
+                # 3. Group bookings split across different check-in sessions
+                if booking['num_adults'] > 1 and random.random() < 0.15:  # 15% for groups
+                    checkin['checkin_time'] = checkin['checkin_time'] + timedelta(hours=random.randint(1, 12))
+                    if (flight_info['scheduled_departure'] - checkin['checkin_time']) < timedelta(minutes=40 if is_domestic else 60):
+                        checkin['checkin_status'] = "too_late"
+                
+                # 4. Baggage weight discrepancies
+                if random.random() < 0.06:  # 6% chance
+                    actual_weight = checkin['checkin_luggage']
+                    checkin['checkin_luggage'] = actual_weight * random.uniform(0.8, 1.3)
+                
+                # Inject document and compliance errors
+                # 1. Missing or incorrect affidavit documentation
+                if checkin['is_affidavit'] and random.random() < 0.12:  # 12% chance
+                    checkin['affidavit_status'] = "MISSING"
+                
+                # 2. International passengers missing required documents
+                if not is_domestic and random.random() < 0.02:  # 2% chance
+                    checkin['document_issue'] = "VISA_MISSING"
+                    checkin['checkin_status'] = "document_review"
+                
+                # 3. Declared dangerous goods not properly flagged
+                if checkin['declared_item'] == 'firearm' and random.random() < 0.05:  # 5% chance
+                    checkin['declared_item'] = None
+                    checkin['security_flag'] = "MISSED_DECLARATION"
+                
+                # 4. Age verification errors for children
+                if passenger['passenger_type'] == 'child' and random.random() < 0.03:  # 3% chance
+                    checkin['passenger_type'] = 'adult'
+                
+                # Inject mobile/digital check-in specific errors
+                # 1. Mobile boarding pass barcode issues
+                if checkin['checkin_channel'] == 'mobile' and random.random() < 0.04:  # 4% chance
+                    checkin['boarding_pass_issue'] = "BARCODE_UNREADABLE"
+                    checkin['checkin_status'] = "reprint_required"
+                
+                # 2. App crashes during seat selection
+                if checkin['checkin_channel'] in ['mobile', 'website'] and random.random() < 0.03:  # 3% chance
+                    checkin['seat_selection_method'] = "AUTO_ASSIGNED_TECH_ISSUE"
+                
+                # 3. Timezone confusion in check-in times
+                if random.random() < 0.02:  # 2% chance
+                    checkin['checkin_time'] = checkin['checkin_time'] + timedelta(hours=random.choice([-2, -1, 1, 2]))
+                    if checkin['checkin_time'] > flight_info['scheduled_departure']:
+                        checkin['checkin_time'] = flight_info['scheduled_departure'] - timedelta(minutes=30)
+                
+                # 4. Payment failures for seat upgrades
+                if random.random() < 0.01:  # 1% chance
+                    checkin['upgrade_payment_failed'] = True
+                
+                # Inject realistic operational patterns
+                # 1. Weather-related check-in delays
+                if flight_info['scheduled_departure'].month in [6, 7, 8] and random.random() < 0.1:  # Winter weather
+                    checkin['checkin_time'] = checkin['checkin_time'] - timedelta(hours=random.randint(2, 8))
+                
+                # 2. Holiday travel chaos
+                if flight_info['scheduled_departure'].month == 12 and flight_info['scheduled_departure'].day > 20:
+                    if random.random() < 0.2:  # 20% chance during holidays
+                        checkin['checkin_time'] = checkin['checkin_time'] + timedelta(minutes=random.randint(15, 60))
+                
+                # 3. Strike or labor action impacts
+                if random.random() < 0.005:  # 0.5% chance
+                    checkin['labor_action_delay'] = True
+                    checkin['checkin_time'] = checkin['checkin_time'] + timedelta(hours=random.randint(2, 12))
+                    checkin['checkin_channel'] = "counter"  # Manual processing only
+                
+                # 4. VIP or frequent flyer processing errors
+                if random.random() < 0.02:  # 2% chance
+                    checkin['status_recognition_failed'] = True
+                
                 checkins.append(checkin)
                 checkin_counter += 1
         
@@ -516,7 +706,7 @@ class Minimum75CheckInsGenerator:
         
         checkins_per_flight = non_infant_checkins.groupby('planning_id').size()
         
-        print(f"\n=== MINIMUM 75 CHECK-INS GENERATION COMPLETE ===")
+        print(f"\n=== MINIMUM 50 CHECK-INS GENERATION COMPLETE ===")
         print(f"Total check-ins generated: {len(checkins_df):,}")
         print(f"Total flights: {checkins_df['planning_id'].nunique():,}")
         print(f"Unique bookings: {checkins_df['booking_id'].nunique():,}")
@@ -580,20 +770,20 @@ class Minimum75CheckInsGenerator:
         else:
             print(f"\nSUCCESS: No seat conflicts detected!")
 
-def generate_minimum_75_checkins(target_year: int = 2021):
-    """Generate check-ins with minimum 75 passengers per flight."""
-    print(f"Starting MINIMUM 75 CHECK-INS generation for {target_year}")
+def generate_minimum_50_checkins(target_year: int = 2021):
+    """Generate check-ins with minimum 50 passengers per flight."""
+    print(f"Starting MINIMUM 50 CHECK-INS generation for {target_year}")
     print("=" * 60)
-    print("GUARANTEE: Every flight will have at least 75 checked-in passengers")
+    print("GUARANTEE: Every flight will have at least 50 checked-in passengers")
     print("METHOD: Existing passengers (excluding cancellations) + synthetic passengers as needed")
     print("CHECK-IN RULES: 40 min (domestic) or 60 min (international) before departure")
     print("=" * 60)
     
     try:
-        generator = Minimum75CheckInsGenerator(target_year=target_year)
+        generator = Minimum50CheckInsGenerator(target_year=target_year)
         checkins_df = generator.generate_checkins()
         
-        print(f"\nSuccessfully generated minimum 75 check-ins per flight for {target_year}!")
+        print(f"\nSuccessfully generated minimum 50 check-ins per flight for {target_year}!")
         return checkins_df
         
     except Exception as e:
@@ -607,7 +797,7 @@ if __name__ == "__main__":
     np.random.seed(seed_int)
     
     TARGET_YEAR = 2021
-    checkins = generate_minimum_75_checkins(target_year=TARGET_YEAR)
+    checkins = generate_minimum_50_checkins(target_year=TARGET_YEAR)
     
     if not checkins.empty:
         print(f"\nSample check-ins:")
@@ -627,11 +817,11 @@ if __name__ == "__main__":
         print(f"   Average passengers per flight: {avg_passengers:.1f}")
         print(f"   Total flights: {len(non_infant_per_flight):,}")
         
-        if min_passengers >= 75:
-            print(f"\nSUCCESS: All flights have at least 75 passengers!")
+        if min_passengers >= 50:
+            print(f"\nSUCCESS: All flights have at least 50 passengers!")
         else:
-            print(f"\nFAILURE: Some flights have fewer than 75 passengers!")
-            problem_flights = non_infant_per_flight[non_infant_per_flight < 75]
+            print(f"\nFAILURE: Some flights have fewer than 50 passengers!")
+            problem_flights = non_infant_per_flight[non_infant_per_flight < 50]
             print(f"   Problem flights: {len(problem_flights)}")
             for flight_id, count in problem_flights.head().items():
                 print(f"     {flight_id}: {count} passengers")
