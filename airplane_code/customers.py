@@ -25,6 +25,10 @@ SA_COMPANIES = [
     'Imperial Logistics', 'Superbalist', 'Takealot', 'Woolworths', 'Pick n Pay'
 ]
 
+# Add team/school related companies
+team_companies = ['Cricket South Africa', 'Rugby South Africa', 'Netball South Africa', 'Department of Basic Education']
+SA_COMPANIES += team_companies
+
 # Phone plans dictionary with Faker locales
 PHONE_PLANS = {
     'South Africa': {'cc': '+27', 'nsn_length': 9, 'mobile_prefixes': ['60','61','62','63','64','65','66','67','68','71','72','73','74','76','78','79','81','82','83','84'], 'faker_locale': 'zu_ZA'},
@@ -192,19 +196,101 @@ def get_city_province(nationality, faker_instance):
         return city, province
 
 class Person:
-    def __init__(self, client_id, is_main_holder=False):
+    def __init__(self, client_id, is_main_holder=False, is_team=False, group_type=None, main_info=None):
         """Generate customer information with realistic errors."""
-        # Ensure 60% South Africans
-        self.nationality = random.choices(
-            ['South Africa'] + [c for c in PHONE_PLANS.keys() if c != 'South Africa'],
-            weights=[(random.randint(60, 100) / 100) * 1.00] + [((random.randint(20, 40) / 100) * 1.00) / (len(PHONE_PLANS) - 1)] * (len(PHONE_PLANS) - 1)
-        )[0]
-        self.faker = FAKER_INSTANCES[self.nationality]
         self.client_id = client_id
         self.is_main_holder = is_main_holder
+        self.is_team = is_team
+        self.group_type = group_type
+        self.main_info = main_info
 
-        # Basic info
-        self.name = self.faker.name()
+        if not is_main_holder and main_info:
+            self.nationality = main_info['nationality']
+            self.faker = main_info['faker']
+            self.address = main_info['address']
+            self.city = main_info['city']
+            self.province_state = main_info['province_state']
+            self.marketing_consent = main_info['marketing_consent']
+            self.comm_pref = main_info['comm_pref']
+            self.date_of_registration = main_info['date_of_registration']
+            self.entry_mode = main_info['entry_mode']
+            self.partner_company = main_info['partner_company']
+        else:
+            # Ensure 60% South Africans
+            self.nationality = random.choices(
+                ['South Africa'] + [c for c in PHONE_PLANS.keys() if c != 'South Africa'],
+                weights=[(random.randint(60, 100) / 100) * 1.00] + [((random.randint(20, 40) / 100) * 1.00) / (len(PHONE_PLANS) - 1)] * (len(PHONE_PLANS) - 1)
+            )[0]
+            self.faker = FAKER_INSTANCES[self.nationality]
+
+            # Address details
+            self.address = self.faker.street_address()
+            # Error: 3% chance of missing or incomplete address
+            if random.random() < 0.03:
+                self.address = None if random.choice([True, False]) else self.address.split()[0]
+
+            # Get city and province
+            self.city, self.province_state = get_city_province(self.nationality, self.faker)
+            # Error: 2% chance of missing city or province
+            if random.random() < 0.02:
+                self.city = None
+            if random.random() < 0.02:
+                self.province_state = None
+
+            self.marketing_consent = random.choices(['Yes', 'No'], weights=[0.7, 0.3])[0]
+            # Error: 5% chance of missing marketing consent
+            if random.random() < 0.05:
+                self.marketing_consent = None
+
+            self.comm_pref = random.choices(['Email', 'SMS', 'Phone', 'Mail'], weights=[0.4, 0.3, 0.2, 0.1])[0]
+            # Error: 3% chance of missing communication preference
+            if random.random() < 0.03:
+                self.comm_pref = None
+
+            # Registration details
+            self.date_of_registration = self.faker.date_between(start_date=date(TARGET_YEAR, 1, 1), end_date=date(TARGET_YEAR, 12, 31))
+            # Error: 1% chance of invalid registration date (e.g., future date)
+            if random.random() < 0.01:
+                self.date_of_registration = self.faker.date_between(start_date=date(TARGET_YEAR + 1, 1, 1), end_date=date(TARGET_YEAR + 2, 12, 31))
+
+            self.entry_mode = random.choice(ENTRY_MODES)
+            # Error: 2% chance of invalid entry mode
+            if random.random() < 0.02:
+                self.entry_mode = random.choice(['website', 'MOBILE', 'agent', ''])  # Inconsistent or empty
+
+            # Partner company
+            self.partner_company = None
+            if self.nationality == 'South Africa':
+                if self.is_team:
+                    self.partner_company = random.choice(team_companies)
+                elif random.random() < 0.20:
+                    self.partner_company = random.choice(SA_COMPANIES)
+                # Error: 2% chance of typo in company name
+                if self.partner_company and random.random() < 0.02:
+                    self.partner_company = introduce_typo(self.partner_company)
+
+        # Gender
+        self.gender = random.choices(['M', 'F', 'Other', 'Prefer not to say'], weights=[0.48, 0.48, 0.02, 0.02])[0]
+        # Error: 1% chance of missing gender
+        if random.random() < 0.01:
+            self.gender = None
+
+        # Name
+        if not is_main_holder and main_info and group_type == 'family':
+            if self.gender == 'M':
+                first_name = self.faker.first_name_male()
+            elif self.gender == 'F':
+                first_name = self.faker.first_name_female()
+            else:
+                first_name = self.faker.first_name()
+            self.name = first_name + " " + main_info['surname']
+        else:
+            if self.gender == 'M':
+                self.name = self.faker.name_male()
+            elif self.gender == 'F':
+                self.name = self.faker.name_female()
+            else:
+                self.name = self.faker.name()
         # Error: 3% chance of typo in name or inconsistent capitalization
         if random.random() < 0.03:
             self.name = introduce_typo(self.name)
@@ -216,16 +302,11 @@ class Person:
         self.dob = self.faker.date_of_birth(minimum_age=min_age, maximum_age=80)
         # No future DOB or unrealistic ages
 
-        self.gender = random.choices(['M', 'F', 'Other', 'Prefer not to say'], weights=[0.48, 0.48, 0.02, 0.02])[0]
-        # Error: 1% chance of missing gender
-        if random.random() < 0.01:
-            self.gender = None
-
         # ID details
         if self.nationality == 'South Africa':
             self.id_type = random.choices(['National ID', 'Passport', "Driver's License"], weights=[0.6, 0.3, 0.1])[0]
         else:
-            self.id_type = random.choices(['Passport', "Driver's License"], weights=[0.7, 0.3])[0]
+            self.id_type = 'Passport'  # Enforce passport for all non-South Africans
         self.id_number = generate_id_number(self.nationality, self.id_type, self.dob, self.gender, self.faker)
         self.travel_document_expiry = self.faker.date_between(start_date=date(TARGET_YEAR, 1, 1), end_date=date(TARGET_YEAR + 10, 12, 31)) if self.id_type == 'Passport' else None
         # Error: 2% chance of expired passport before registration
@@ -238,6 +319,13 @@ class Person:
         # Contact details
         email_domain = random.choice(['gmail.com', 'outlook.com', 'yahoo.com', 'hotmail.com'])
         email_name = re.sub(r'[^a-zA-Z0-9]', '', self.name.lower().replace(' ', '.'))
+        if len(email_name) > 20:
+            parts = self.name.split()
+            if len(parts) > 1:
+                initials = ''.join([p[0] for p in parts[:-1]])
+                surname = parts[-1]
+                email_name = initials.lower() + '.' + surname.lower()
+                email_name = re.sub(r'[^a-zA-Z0-9]', '', email_name)
         self.email_address = f'{email_name}@{email_domain}'
         # Error: 5% chance of invalid or missing email
         if random.random() < 0.05:
@@ -252,78 +340,57 @@ class Person:
         if random.random() < 0.03:
             self.phone_number = None
 
-        self.address = self.faker.street_address()
-        # Error: 3% chance of missing or incomplete address
-        if random.random() < 0.03:
-            self.address = None if random.choice([True, False]) else self.address.split()[0]
-
-        # Get city and province
-        self.city, self.province_state = get_city_province(self.nationality, self.faker)
-        # Error: 2% chance of missing city or province
-        if random.random() < 0.02:
-            self.city = None
-        if random.random() < 0.02:
-            self.province_state = None
-
-        self.marketing_consent = random.choices(['Yes', 'No'], weights=[0.7, 0.3])[0]
-        # Error: 5% chance of missing marketing consent
-        if random.random() < 0.05:
-            self.marketing_consent = None
-
-        self.comm_pref = random.choices(['Email', 'SMS', 'Phone', 'Mail'], weights=[0.4, 0.3, 0.2, 0.1])[0]
-        # Error: 3% chance of missing communication preference
-        if random.random() < 0.03:
-            self.comm_pref = None
-
-        # Registration details
-        self.date_of_registration = self.faker.date_between(start_date=date(TARGET_YEAR, 1, 1), end_date=date(TARGET_YEAR, 12, 31))
-        # Error: 1% chance of invalid registration date (e.g., future date)
-        if random.random() < 0.01:
-            self.date_of_registration = self.faker.date_between(start_date=date(TARGET_YEAR + 1, 1, 1), end_date=date(TARGET_YEAR + 2, 12, 31))
-
-        self.entry_mode = random.choice(ENTRY_MODES)
-        # Error: 2% chance of invalid entry mode
-        if random.random() < 0.02:
-            self.entry_mode = random.choice(['website', 'MOBILE', 'agent', ''])  # Inconsistent or empty
-
-        # New field: Partner company (only for South Africans, 20% chance of affiliation)
-        if self.nationality == 'South Africa' and random.random() < 0.20:
-            self.partner_company = random.choice(SA_COMPANIES)
-            # Error: 2% chance of typo in company name
-            if random.random() < 0.02:
-                self.partner_company = introduce_typo(self.partner_company)
-        else:
-            self.partner_company = None
-
 def generate_clients():
     """Generate client data with shared client IDs and occasional duplicates."""
     data = []
     client_counter = 1
     individuals_left = NUM_INDIVIDUALS
 
-    for _ in tqdm(range(NUM_INDIVIDUALS), desc="Generating clients"):
-        group_size = random.choices([1, 2, 3, 4, 5], weights=[0.5, 0.3, 0.15, 0.03, 0.02])[0]
+    pbar = tqdm(total=NUM_INDIVIDUALS, desc="Generating clients")
+    while individuals_left > 0:
+        group_size = random.choices([1, 2, 3, 4, 5, 10, 15, 20, 25, 30], weights=[0.5, 0.3, 0.15, 0.03, 0.02, 0.002, 0.002, 0.002, 0.002, 0.002])[0]
         group_size = min(group_size, individuals_left)
         if group_size == 0:
             break
 
+        is_family = group_size <= 5
+        is_team = group_size > 5
+
         client_id = f"CL{TARGET_YEAR}{client_counter:04d}"
         
         # Main holder
-        main_holder = Person(client_id, is_main_holder=True)
+        main_holder = Person(client_id, is_main_holder=True, is_team=is_team)
         data.append(main_holder.__dict__)
         # Error: 1% chance of duplicating main holder with slight variation
         if random.random() < 0.01:
-            duplicate = Person(client_id, is_main_holder=True)
+            duplicate = Person(client_id, is_main_holder=True, is_team=is_team)
             duplicate.email_address = f"duplicate_{duplicate.email_address}"
             data.append(duplicate.__dict__)
 
         # Additional members
+        main_info = {
+            'surname': main_holder.name.split()[-1] if ' ' in main_holder.name else main_holder.name,
+            'nationality': main_holder.nationality,
+            'faker': main_holder.faker,
+            'address': main_holder.address,
+            'city': main_holder.city,
+            'province_state': main_holder.province_state,
+            'marketing_consent': main_holder.marketing_consent,
+            'comm_pref': main_holder.comm_pref,
+            'date_of_registration': main_holder.date_of_registration,
+            'entry_mode': main_holder.entry_mode,
+            'partner_company': main_holder.partner_company
+        }
+        group_type = 'family' if is_family else 'team'
         for _ in range(group_size - 1):
-            data.append(Person(client_id, is_main_holder=False).__dict__)
+            member = Person(client_id, is_main_holder=False, group_type=group_type, main_info=main_info)
+            data.append(member.__dict__)
         
         client_counter += 1
         individuals_left -= group_size
+        pbar.update(group_size)
+
+    pbar.close()
 
     # Convert to DataFrame
     df = pd.DataFrame(data)
