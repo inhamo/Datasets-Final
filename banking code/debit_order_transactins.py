@@ -6,9 +6,28 @@ from datetime import datetime, timedelta
 import os
 import glob
 from tqdm import tqdm
+from pandas.tseries.holiday import Holiday, AbstractHolidayCalendar
+from pandas.tseries.offsets import CustomBusinessDay
 
-# Set the default start year here (change this to your desired year)
-START_YEAR = 2018
+# Define South African public holidays dynamically
+class SouthAfricanCalendar(AbstractHolidayCalendar):
+    rules = [
+        Holiday('New Year\'s Day', month=1, day=1),
+        Holiday('Human Rights Day', month=3, day=21),
+        Holiday('Good Friday', month=4, day=19, year=2019),  # Varies, hardcoded for 2019
+        Holiday('Family Day', month=4, day=22, year=2019),   # Varies, hardcoded for 2019
+        Holiday('Freedom Day', month=4, day=27),
+        Holiday('Workers\' Day', month=5, day=1),
+        Holiday('Youth Day', month=6, day=16),
+        Holiday('National Women\'s Day', month=8, day=9),
+        Holiday('Heritage Day', month=9, day=24),
+        Holiday('Day of Reconciliation', month=12, day=16),
+        Holiday('Christmas Day', month=12, day=25),
+        Holiday('Day of Goodwill', month=12, day=26)
+    ]
+
+# Set the default start year
+START_YEAR = 2024
 
 def generate_debit_order_transactions_for_year(target_year, min_year=START_YEAR):
     """
@@ -21,6 +40,7 @@ def generate_debit_order_transactions_for_year(target_year, min_year=START_YEAR)
     
     # Initialize Faker
     fake = Faker()
+    Faker.seed(target_year)  # Seed for reproducibility
     
     # File paths
     github_repo_path = 'banking_data'
@@ -44,23 +64,21 @@ def generate_debit_order_transactions_for_year(target_year, min_year=START_YEAR)
     debit_orders_df = pd.concat(all_debit_orders, ignore_index=True)
     print(f"Total debit orders loaded from {min_year} to {target_year}: {len(debit_orders_df)}")
     
-    # Load accounts data to get transaction costs (if available)
+    # Load accounts data to get transaction costs and status
     try:
         account_files = sorted(glob.glob(f'{github_repo_path}/accounts_*.parquet'))
         if account_files:
             accounts_list = [pd.read_parquet(f) for f in account_files]
             accounts_df = pd.concat(accounts_list, ignore_index=True).drop_duplicates(subset=['account_id'])
-            
-            # Create transaction cost mapping (default to 5.0 if not available)
-            if "transaction_cost" in accounts_df.columns:
-                account_cost_map = dict(zip(accounts_df["account_id"], accounts_df["transaction_cost"]))
-            else:
-                account_cost_map = {acc: 5.0 for acc in accounts_df["account_id"]}
+            account_cost_map = dict(zip(accounts_df["account_id"], accounts_df.get("transaction_cost", 5.0)))
+            account_status_map = dict(zip(accounts_df["account_id"], accounts_df.get("status", "active")))
         else:
             account_cost_map = {}
+            account_status_map = {}
     except Exception as e:
         print(f"Could not load accounts data: {e}")
         account_cost_map = {}
+        account_status_map = {}
     
     # Filter active debit orders only
     active_debit_orders = debit_orders_df[debit_orders_df["status"] == "Active"].copy()
@@ -68,120 +86,145 @@ def generate_debit_order_transactions_for_year(target_year, min_year=START_YEAR)
     
     # Convert date columns to datetime, handling missing columns
     active_debit_orders["start_date"] = pd.to_datetime(active_debit_orders["start_date"])
-    if "end_date" in active_debit_orders.columns:
-        active_debit_orders["end_date"] = pd.to_datetime(active_debit_orders["end_date"])
-    else:
-        active_debit_orders["end_date"] = pd.NaT
-    if "cancellation_date" in active_debit_orders.columns:
-        active_debit_orders["cancellation_date"] = pd.to_datetime(active_debit_orders["cancellation_date"])
-    else:
-        active_debit_orders["cancellation_date"] = pd.NaT
-    
-    # Transaction channels for debit orders
-    channels = ["Online", "Mobile", "ATM", "Branch", "Automated"]
+    active_debit_orders["end_date"] = pd.to_datetime(active_debit_orders.get("end_date", pd.NaT))
+    active_debit_orders["cancellation_date"] = pd.to_datetime(active_debit_orders.get("cancellation_date", pd.NaT))
+    active_debit_orders["suspension_date"] = pd.to_datetime(active_debit_orders.get("suspension_date", pd.NaT))
     
     # Transaction statuses with weights
     transaction_statuses = ["Completed", "Failed", "Cancelled"]
-    status_weights = [0.92, 0.06, 0.02]  # Most debit orders complete successfully
+    status_weights_base = [0.92, 0.06, 0.02]
+    
+    # SA bank names for external transfers
+    sa_banks = ['Standard Bank', 'FNB', 'ABSA', 'Nedbank', 'Capitec', 'TymeBank', 'African Bank']
     
     transactions = []
     txn_counter = 1
     
-    # Generate date range for the specific year only
-    start_date = datetime(target_year, 1, 1)
-    end_date = datetime(target_year, 12, 31)
-    date_range = pd.date_range(start_date, end_date)
+    # Generate business day calendar for the target year
+    sa_calendar = SouthAfricanCalendar()
+    bday = CustomBusinessDay(calendar=sa_calendar)
+    date_range = pd.date_range(start=f"{target_year}-01-01", end=f"{target_year}-12-31", freq=bday)
     
     def debit_order_occurs_on(debit_order, date):
         """Check if a debit order should occur on a specific date"""
         freq = debit_order["frequency"]
         start = debit_order["start_date"]
         end = debit_order["end_date"] if pd.notnull(debit_order["end_date"]) else pd.Timestamp("2025-12-31")
+        suspension_date = debit_order["suspension_date"] if pd.notnull(debit_order["suspension_date"]) else pd.NaT
         
         # Check if date is within the active period
         if not (start <= date <= end):
             return False
             
-        # Check if order was cancelled before this date
+        # Check if order was cancelled or suspended before this date
         if pd.notnull(debit_order["cancellation_date"]) and date >= debit_order["cancellation_date"]:
             return False
+        if pd.notnull(suspension_date) and date >= suspension_date:
+            return False
         
-        # Check frequency patterns
+        # Special case for School Fees (Jan, Apr, Jul, Oct)
+        if debit_order["debit_order_type"] == "School Fees":
+            return date.month in [1, 4, 7, 10] and (date.day == start.day or (start.day > 28 and date.day == min(28, date.days_in_month)))
+        
+        # Special case for Insurance Premium (annual in specific month)
+        if debit_order["debit_order_type"] == "Insurance Premium" and freq == "Annually":
+            return date.month == start.month and (date.day == start.day or (start.day > 28 and date.day == min(28, date.days_in_month)))
+        
+        # Standard frequency patterns
         if freq == "Monthly":
-            # Monthly on the same day of month as start date
             return date.day == start.day or (start.day > 28 and date.day == min(28, date.days_in_month))
         elif freq == "Weekly":
-            # Weekly on the same weekday
             return date.weekday() == start.weekday()
         elif freq == "Quarterly":
-            # Quarterly (every 3 months on same day)
             months_diff = (date.year - start.year) * 12 + (date.month - start.month)
             return months_diff % 3 == 0 and (date.day == start.day or (start.day > 28 and date.day == min(28, date.days_in_month)))
         elif freq == "Annually":
-            # Annually on same date
             return date.month == start.month and (date.day == start.day or (start.day > 28 and date.day == min(28, date.days_in_month)))
-        else:
-            return False
+        return False
     
     print(f"Generating debit order transactions for {target_year}...")
     
-    # Process each date in the year
+    # Process each business day in the year
     for single_date in tqdm(date_range, desc="Processing dates"):
         day_transactions = []
         
-        # Check each active debit order
         for _, debit_order in active_debit_orders.iterrows():
             if debit_order_occurs_on(debit_order, single_date):
+                # Check account status
+                account_id = debit_order["account_id"]
+                account_status = account_status_map.get(account_id, "active")
+                if account_status in ["closed", "frozen"]:
+                    status = "Failed"
+                    description = f"{debit_order['description']} - Failed: account_not_operational"
+                    amount = 0.0
+                else:
+                    # Determine transaction status
+                    status_weights = status_weights_base.copy()
+                    if debit_order.get("suspension_reason") == "insufficient_funds":
+                        status_weights = [0.7, 0.25, 0.05]
+                    status = np.random.choice(transaction_statuses, p=status_weights)
+                    description = debit_order["description"]
+                    
+                    # Adjust amount for utilities if not fixed
+                    amount = debit_order["amount"]
+                    is_fixed_amount = debit_order.get("is_fixed_amount", True)
+                    if debit_order["debit_order_type"] == "Utility Bill" and not is_fixed_amount:
+                        amount = round(amount * random.uniform(0.8, 1.2), 2)
                 
-                # Determine transaction status
-                status = np.random.choice(transaction_statuses, p=status_weights)
+                # Determine transaction time based on type
+                if debit_order["debit_order_type"] in ["Salary Payment", "Payroll"]:
+                    txn_hour, txn_minute, txn_second = 6, 0, 0  # 06:00:00
+                elif debit_order["debit_order_type"] in ["Loan Repayment", "Business Loan Repayment"]:
+                    if random.random() < 0.95:
+                        txn_hour = random.randint(6, 7)
+                        txn_minute = random.randint(0, 59)
+                        txn_second = random.randint(0, 59)
+                    else:
+                        txn_hour = random.randint(8, 17)
+                        txn_minute = random.randint(0, 59)
+                        txn_second = random.randint(0, 59)
+                elif debit_order["debit_order_type"] == "Utility Bill":
+                    time_peaks = [(8, 0.4), (12, 0.35), (16, 0.25)]  # Peaks at 08:00, 12:00, 16:00, summing to 1
+                    peak_probs = [p for _, p in time_peaks]
+                    if random.random() < 0.7:
+                        txn_hour = np.random.choice([h for h, _ in time_peaks], p=peak_probs)
+                        txn_minute = random.randint(0, 15)
+                    else:
+                        txn_hour = random.randint(6, 17)
+                        txn_minute = random.randint(0, 59)
+                    txn_second = random.randint(0, 59)
+                else:
+                    txn_hour = random.randint(6, 17)
+                    txn_minute = random.randint(0, 59)
+                    txn_second = random.randint(0, 59)
                 
-                # Generate transaction time (debit orders typically process early morning)
-                if random.random() < 0.7:  # 70% process between 06:00-09:00
-                    txn_hour = random.randint(6, 8)
-                else:  # 30% process throughout business hours
-                    txn_hour = random.randint(9, 17)
-                txn_minute = random.randint(0, 59)
-                txn_second = random.randint(0, 59)
                 txn_time = f"{txn_hour:02d}:{txn_minute:02d}:{txn_second:02d}"
                 
-                # Determine if it's an immediate payment (rarely for debit orders)
-                immediate_payment = random.random() < 0.05  # 5% chance
+                # No immediate payments for debit orders
+                immediate_payment = False
+                trans_cost = account_cost_map.get(account_id, 5.0) if immediate_payment else 0.0
                 
-                # Calculate transaction cost
-                trans_cost = account_cost_map.get(debit_order["account_id"], 5.0) if immediate_payment else 0.0
-                
-                # Determine receiving bank (empty if internal account)
+                # Determine receiving bank
                 receiving_bank = ""
-                if not pd.isna(debit_order["account_to"]) and len(str(debit_order["account_to"])) > 20:
-                    # External account (IBAN-like format)
-                    receiving_bank = "External Bank"
-                
-                # EWallet number (only for certain transaction types)
-                ewallet_number = None
-                if "ewallet" in str(debit_order["description"]).lower() or "mobile" in str(debit_order["description"]).lower():
-                    ewallet_number = f"27{random.randint(600000000, 899999999)}"  # SA mobile format
-                
-                # Select channel (debit orders are typically automated)
-                channel_weights = [0.05, 0.10, 0.02, 0.03, 0.80]  # Heavily weighted towards "Automated"
-                channel = np.random.choice(channels, p=channel_weights)
+                if debit_order.get("beneficiary_bank_name"):
+                    receiving_bank = debit_order["beneficiary_bank_name"]
+                elif pd.notna(debit_order["account_to"]) and debit_order["account_to"] not in accounts_df["account_id"].values:
+                    receiving_bank = random.choice(sa_banks)
                 
                 # Create transaction record
                 transaction = {
                     "transaction_id": f"TXN{target_year}{txn_counter:07d}",
-                    "account_id": debit_order["account_id"],
+                    "account_id": account_id,
                     "transaction_date": single_date.strftime("%Y-%m-%d"),
                     "transaction_time": txn_time,
-                    "amount": debit_order["amount"],
-                    "debit_credit": "Debit",  # Debit orders are always debits
+                    "amount": amount,
+                    "debit_credit": "Debit",
                     "status": status,
-                    "description": debit_order["description"] if pd.notnull(debit_order["description"]) else f"{debit_order['debit_order_type']} - {debit_order['debit_order_id']}",
+                    "description": description,
                     "immediate_payment": immediate_payment,
                     "receiving_account": debit_order["account_to"],
                     "transaction_cost": trans_cost,
-                    "ewallet_number": ewallet_number,
-                    "channel": channel,
-                    # Additional debit order specific fields
+                    "channel": "Automated",  # Debit orders are always automated
                     "debit_order_id": debit_order["debit_order_id"],
                     "debit_order_type": debit_order["debit_order_type"],
                     "customer_id": debit_order["customer_id"]
@@ -190,7 +233,6 @@ def generate_debit_order_transactions_for_year(target_year, min_year=START_YEAR)
                 day_transactions.append(transaction)
                 txn_counter += 1
         
-        # Add all transactions for this day
         transactions.extend(day_transactions)
     
     # Create DataFrame
@@ -201,7 +243,7 @@ def generate_debit_order_transactions_for_year(target_year, min_year=START_YEAR)
         print(f"No transactions generated for {target_year}. Please check your debit orders data.")
         return pd.DataFrame()
     
-    # Save to file per year
+    # Save to file
     output_file = f'{github_repo_path}/debit_order_transactions_{target_year}.parquet'
     os.makedirs(github_repo_path, exist_ok=True)
     transactions_df.to_parquet(output_file, index=False)
@@ -224,17 +266,15 @@ def generate_debit_order_transactions_for_year(target_year, min_year=START_YEAR)
     
     return transactions_df
 
-
 def generate_transactions_for_specific_year(year):
     """Generate transactions for a specific year only"""
     return generate_debit_order_transactions_for_year(year)
-
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Generate debit order transactions")
     parser.add_argument('--start_year', type=int, default=START_YEAR, help='Starting year for transaction generation')
-    parser.add_argument('--end_year', type=int, default=2024, help='Ending year for transaction generation (default: 2024)')
+    parser.add_argument('--end_year', type=int, default=2024, help='Ending year for transaction generation')
     
     args = parser.parse_args()
     

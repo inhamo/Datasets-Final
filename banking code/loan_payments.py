@@ -8,12 +8,13 @@ import glob
 from tqdm import tqdm
 import warnings
 
-# Set the default start year here (change this to your desired year)
-START_YEAR = 2018
+# Set the default start year
+START_YEAR = 2024
 
 def generate_loan_payment_transactions_for_year(target_year, min_year=START_YEAR):
     """
     Generate realistic loan payment transactions for a specific year, loading loans from min_year to target_year.
+    All payments are automated.
     
     Parameters:
     target_year (int): The year for which to generate transactions
@@ -79,34 +80,20 @@ def generate_loan_payment_transactions_for_year(target_year, min_year=START_YEAR
     # Convert date columns to datetime
     approved_loans["approval_date"] = pd.to_datetime(approved_loans["approval_date"])
     approved_loans["application_date"] = pd.to_datetime(approved_loans["application_date"])
+    approved_loans["disbursement_date"] = pd.to_datetime(approved_loans.get("disbursement_date"))
     
-    # Add payment automation preferences (realistic distribution)
-    # Most loans start as automatic but some customers prefer manual payments
-    loan_automation_types = np.random.choice(
-        ['automatic', 'manual', 'mixed'], 
-        size=len(approved_loans),
-        p=[0.65, 0.25, 0.10]  # 65% automatic, 25% manual, 10% mixed
-    )
-    approved_loans['payment_automation'] = loan_automation_types
+    # Set all loans to automatic payment
+    approved_loans['payment_automation'] = 'automatic'
     
-    # Transaction channels with realistic weights for different payment types
+    # Transaction channels for automatic payments
     automatic_channels = {
         'Automated': 0.85,
         'Online': 0.10,
         'Mobile': 0.05
     }
     
-    manual_channels = {
-        'Online': 0.40,
-        'Mobile': 0.25,
-        'Branch': 0.15,
-        'ATM': 0.12,
-        'Automated': 0.08  # Some manual payers still use auto-pay occasionally
-    }
-    
-    # Transaction statuses with different weights for automatic vs manual
-    auto_status_weights = [0.96, 0.03, 0.01]  # Higher success rate for automatic
-    manual_status_weights = [0.88, 0.08, 0.04]  # Lower success rate for manual
+    # Transaction statuses for automatic payments
+    auto_status_weights = [0.96, 0.03, 0.01]  # Completed, Failed, Cancelled
     transaction_statuses = ["Completed", "Failed", "Cancelled"]
     
     transactions = []
@@ -118,8 +105,7 @@ def generate_loan_payment_transactions_for_year(target_year, min_year=START_YEAR
     for _, loan in tqdm(approved_loans.iterrows(), total=len(approved_loans), desc="Processing loans"):
         loan_transactions = generate_loan_payment_schedule(
             loan, default_map, account_cost_map,
-            automatic_channels, manual_channels,
-            auto_status_weights, manual_status_weights, 
+            automatic_channels, auto_status_weights, 
             transaction_statuses, txn_counter, target_year, loan_id_col=None
         )
         transactions.extend(loan_transactions)
@@ -136,7 +122,7 @@ def generate_loan_payment_transactions_for_year(target_year, min_year=START_YEAR
     # Introduce realistic data errors for cleaning exercises
     transactions_df = introduce_data_errors(transactions_df)
     
-    # Save to both CSV (for mixed data types) and clean Parquet (without errors)
+    # Save to both CSV (with errors) and clean Parquet
     csv_output_file = f'{github_repo_path}/loan_payment_transactions_{target_year}.csv'
     parquet_output_file = f'{github_repo_path}/loan_payment_transactions_{target_year}.parquet'
     
@@ -176,7 +162,7 @@ def clean_loan_data(loans_df):
         print("Warning: No loan amount column found, skipping amount validation")
     
     # Check for monthly installment column
-    installment_columns = ['monthly_installment', 'installment_amount', 'monthly_payment', 'payment_amount']
+    installment_columns = ['monthly_installment', 'installment_amount', 'monthly_payment', 'payment_amount', 'reduced_installment']
     installment_col = None
     for col in installment_columns:
         if col in loans_df.columns:
@@ -188,7 +174,7 @@ def clean_loan_data(loans_df):
         print(f"Using '{installment_col}' as monthly installment column")
     else:
         print("Warning: No monthly installment column found!")
-        return pd.DataFrame()  # Return empty if no installment column
+        return pd.DataFrame()
     
     # Check for terms column
     terms_columns = ['terms_months', 'term_months', 'loan_term', 'duration_months']
@@ -234,39 +220,38 @@ def clean_loan_data(loans_df):
     return loans_df
 
 def generate_loan_payment_schedule(loan, default_map, account_cost_map,
-                                 automatic_channels, manual_channels,
-                                 auto_status_weights, manual_status_weights,
+                                 automatic_channels, auto_status_weights, 
                                  transaction_statuses, start_txn_counter, target_year, loan_id_col=None):
     """Generate payment schedule for a single loan, only for the target year"""
     loan_transactions = []
     txn_counter = start_txn_counter
     
     # Get column names dynamically
-    installment_columns = ['monthly_installment', 'installment_amount', 'monthly_payment', 'payment_amount']
+    installment_columns = ['monthly_installment', 'installment_amount', 'monthly_payment', 'payment_amount', 'reduced_installment']
     terms_columns = ['terms_months', 'term_months', 'loan_term', 'duration_months']
     loan_id_columns = ['loan_id', 'id', 'loan_reference']
     
     # Find the correct column names
-    monthly_payment_col = next((col for col in installment_columns if col in loan.index), None)
+    monthly_payment_col = 'reduced_installment' if loan.get('under_debt_review', False) and 'reduced_installment' in loan.index else next((col for col in installment_columns if col in loan.index), None)
     terms_col = next((col for col in terms_columns if col in loan.index), None)
     if loan_id_col is None:
         loan_id_col = next((col for col in loan_id_columns if col in loan.index), None)
     
     if not monthly_payment_col or not terms_col or not loan_id_col:
-        print(f"Warning: Missing required columns for loan processing")
+        print(f"Warning: Missing required columns for loan {loan.get(loan_id_col, 'UNKNOWN')}")
         return []
     
-    # Calculate actual payment dates based on approval date
-    approval_date = loan["approval_date"]
+    # Calculate actual payment dates based on disbursement date and payment_day
+    disbursement_date = pd.to_datetime(loan.get("disbursement_date", loan["approval_date"]))
     terms_months = loan[terms_col]
     monthly_payment = loan[monthly_payment_col]
     loan_id = loan[loan_id_col]
-    payment_automation = loan.get('payment_automation', 'automatic')
+    payment_day = loan.get("payment_day", 1)  # Default to 1st if not specified
     
-    # First payment is typically 30 days after approval
-    first_payment_date = approval_date + timedelta(days=30)
-    # Adjust to first of month for simplicity
-    first_payment_date = first_payment_date.replace(day=1)
+    # First payment is on payment_day of the next month after disbursement
+    first_payment_date = (disbursement_date + pd.DateOffset(months=1)).replace(day=payment_day)
+    if first_payment_date.day != payment_day:  # Adjust for months with fewer days
+        first_payment_date = first_payment_date.replace(day=min(payment_day, pd.Timestamp(first_payment_date).days_in_month))
     
     # Check if loan defaults
     will_default = False
@@ -281,6 +266,8 @@ def generate_loan_payment_schedule(loan, default_map, account_cost_map,
     # Generate each monthly payment
     for month in range(int(terms_months)):
         payment_date = first_payment_date + pd.DateOffset(months=month)
+        if payment_date.day != payment_day:
+            payment_date = payment_date.replace(day=min(payment_day, pd.Timestamp(payment_date).days_in_month))
         
         # Only generate for target year
         if payment_date.year != target_year:
@@ -291,9 +278,7 @@ def generate_loan_payment_schedule(loan, default_map, account_cost_map,
         is_recovery_attempt = False
         
         if will_default and payment_date >= default_date:
-            # After default, some recovery attempts may occur
             if recovery_attempts > 0:
-                # Recovery attempts happen sporadically
                 if random.random() < 0.3:  # 30% chance of recovery attempt
                     should_process_payment = True
                     is_recovery_attempt = True
@@ -306,15 +291,15 @@ def generate_loan_payment_schedule(loan, default_map, account_cost_map,
         if not should_process_payment:
             continue
         
-        # Generate payment variations (partial, late fees, early payments, etc.)
+        # Generate payment variations (partial, late fees, early payments)
         payment_variations = generate_payment_variations(
-            monthly_payment, payment_date, is_recovery_attempt, payment_automation
+            monthly_payment, payment_date, is_recovery_attempt
         )
         
         for variation in payment_variations:
             transaction = create_transaction_record(
-                loan, payment_date, variation, automatic_channels, manual_channels,
-                auto_status_weights, manual_status_weights, transaction_statuses,
+                loan, payment_date, variation, automatic_channels,
+                auto_status_weights, transaction_statuses,
                 account_cost_map, txn_counter, target_year, is_recovery_attempt, loan_id_col
             )
             loan_transactions.append(transaction)
@@ -322,113 +307,83 @@ def generate_loan_payment_schedule(loan, default_map, account_cost_map,
     
     return loan_transactions
 
-def generate_payment_variations(base_amount, payment_date, is_recovery_attempt, payment_automation):
-    """Generate realistic payment variations"""
+def generate_payment_variations(monthly_payment, payment_date, is_recovery_attempt):
+    """Generate variations in payment amounts (late, partial, extra)"""
     variations = []
+    base_amount = round(float(monthly_payment), 2)
     
     if is_recovery_attempt:
-        # Recovery attempts often partial payments
-        if random.random() < 0.6:  # 60% partial payments during recovery
-            partial_amount = round(base_amount * random.uniform(0.2, 0.8), 2)
-            variations.append({
-                'amount': partial_amount,
-                'type': 'partial_payment',
-                'description_suffix': '- Partial Payment'
-            })
-        else:
-            variations.append({
-                'amount': base_amount,
-                'type': 'regular_payment',
-                'description_suffix': '- Recovery Payment'
-            })
-    else:
-        # Regular payment scenarios
-        rand = random.random()
-        
-        if rand < 0.85:  # 85% regular payments
-            variations.append({
-                'amount': base_amount,
-                'type': 'regular_payment',
-                'description_suffix': ''
-            })
-        elif rand < 0.92:  # 7% late payments with fees
-            late_fee = round(base_amount * random.uniform(0.02, 0.05), 2)  # 2-5% late fee
-            variations.append({
-                'amount': base_amount + late_fee,
-                'type': 'late_payment',
-                'description_suffix': f'- Late Payment (Fee: R{late_fee})'
-            })
-        elif rand < 0.96:  # 4% partial payments
-            partial_amount = round(base_amount * random.uniform(0.5, 0.95), 2)
-            variations.append({
-                'amount': partial_amount,
-                'type': 'partial_payment',
-                'description_suffix': '- Partial Payment'
-            })
-        else:  # 4% early/extra payments
-            extra_amount = round(base_amount * random.uniform(1.1, 2.0), 2)
-            variations.append({
-                'amount': extra_amount,
-                'type': 'extra_payment',
-                'description_suffix': '- Extra Principal Payment'
-            })
+        # Recovery payments may be partial
+        recovery_amount = round(base_amount * random.gauss(0.6, 0.1), 2)
+        variations.append({
+            'amount': max(recovery_amount, 0),
+            'type': 'recovery_payment',
+            'description_suffix': '- Recovery Payment'
+        })
+        return variations
+    
+    # Normal payment variations
+    rand = random.random()
+    if rand < 0.92:  # 92% standard payments
+        variations.append({
+            'amount': base_amount,
+            'type': 'standard_payment',
+            'description_suffix': ''
+        })
+    elif rand < 0.96:  # 4% late payments
+        late_fee = round(base_amount * 0.05, 2)  # 5% late fee
+        variations.append({
+            'amount': base_amount + late_fee,
+            'type': 'late_payment',
+            'description_suffix': f'- Late Payment (Fee: R{late_fee})'
+        })
+    elif rand < 0.98:  # 2% partial payments
+        partial_amount = round(base_amount * random.gauss(0.7, 0.1), 2)
+        variations.append({
+            'amount': max(partial_amount, 0),
+            'type': 'partial_payment',
+            'description_suffix': '- Partial Payment'
+        })
+    else:  # 2% extra payments
+        extra_amount = round(base_amount * random.gauss(1.5, 0.2), 2)
+        variations.append({
+            'amount': max(extra_amount, 0),
+            'type': 'extra_payment',
+            'description_suffix': '- Extra Principal Payment'
+        })
     
     return variations
 
-def create_transaction_record(loan, payment_date, variation, automatic_channels, manual_channels,
-                            auto_status_weights, manual_status_weights, transaction_statuses,
+def create_transaction_record(loan, payment_date, variation, automatic_channels,
+                            auto_status_weights, transaction_statuses,
                             account_cost_map, txn_counter, target_year, is_recovery_attempt, loan_id_col):
     """Create a single transaction record"""
     
-    payment_automation = loan.get('payment_automation', 'automatic')
     loan_id = loan[loan_id_col]
     
-    # Determine channel and timing based on automation type
-    if payment_automation == 'automatic' or (payment_automation == 'mixed' and random.random() < 0.7):
-        # Automatic payments
-        channel = np.random.choice(list(automatic_channels.keys()), p=list(automatic_channels.values()))
-        status = np.random.choice(transaction_statuses, p=auto_status_weights)
-        
-        if channel == 'Automated':
-            # Automated payments occur at consistent times (early morning)
-            txn_hour = random.choice([2, 3, 4])  # 2-4 AM processing
-            txn_minute = random.randint(0, 59)
-        else:
-            # Online/Mobile automatic still early but more varied
-            txn_hour = random.randint(1, 6)
-            txn_minute = random.randint(0, 59)
+    # Automatic payment channel and status
+    channel = np.random.choice(list(automatic_channels.keys()), p=list(automatic_channels.values()))
+    status = np.random.choice(transaction_statuses, p=auto_status_weights)
+    
+    # Automated payments occur early morning
+    if channel == 'Automated':
+        txn_hour = random.choice([2, 3, 4])  # 2-4 AM processing
+        txn_minute = random.randint(0, 59)
     else:
-        # Manual payments
-        channel = np.random.choice(list(manual_channels.keys()), p=list(manual_channels.values()))
-        status = np.random.choice(transaction_statuses, p=manual_status_weights)
-        
-        # Manual payments during business hours or evening
-        if channel == 'Branch':
-            txn_hour = random.randint(9, 16)  # Branch hours
-        elif channel == 'ATM':
-            txn_hour = random.randint(8, 22)  # Extended ATM hours
-        else:  # Online/Mobile
-            txn_hour = random.randint(7, 23)  # Most flexible timing
-        
+        txn_hour = random.randint(1, 6)  # Online/Mobile early but varied
         txn_minute = random.randint(0, 59)
     
     txn_second = random.randint(0, 59)
     txn_time = f"{txn_hour:02d}:{txn_minute:02d}:{txn_second:02d}"
     
     # Determine if immediate payment (higher cost)
-    immediate_payment = False
-    if channel in ['Online', 'Mobile'] and random.random() < 0.08:  # 8% immediate
-        immediate_payment = True
+    immediate_payment = channel in ['Online', 'Mobile'] and random.random() < 0.08
     
     # Calculate transaction cost
     account_id = loan.get("account_id", "UNKNOWN")
     base_cost = account_cost_map.get(account_id, 5.0)
     if immediate_payment:
         trans_cost = base_cost * 2  # Double cost for immediate
-    elif channel == 'Branch':
-        trans_cost = base_cost * 1.5  # Higher cost for branch
-    elif channel == 'ATM':
-        trans_cost = base_cost
     else:
         trans_cost = base_cost * 0.5  # Lower cost for digital channels
     
@@ -507,7 +462,7 @@ def introduce_data_errors(df):
     
     # 6. Inconsistent channel values (0.8%)
     invalid_channel_indices = np.random.choice(n_rows, int(n_rows * 0.008), replace=False)
-    invalid_channels = ['ONLINE', 'mobile', 'Branch Office', 'atm', '']
+    invalid_channels = ['ONLINE', 'mobile', 'Automated System', '']
     for idx in invalid_channel_indices:
         df_with_errors.loc[idx, 'channel'] = random.choice(invalid_channels)
     
@@ -517,13 +472,13 @@ def introduce_data_errors(df):
     for idx in invalid_status_indices:
         df_with_errors.loc[idx, 'status'] = random.choice(invalid_statuses)
     
-    # 8. Mixed data types in numeric columns (create string representations)
+    # 8. Mixed data types in numeric columns
     mixed_type_indices = np.random.choice(n_rows, int(n_rows * 0.003), replace=False)
     for idx in mixed_type_indices:
         original_amount = df_with_errors.loc[idx, 'amount']
         df_with_errors.loc[idx, 'amount'] = f"R{original_amount}"
     
-    # 8b. Mixed data types in transaction_cost column
+    # 8b. Mixed data types in transaction_cost
     mixed_cost_indices = np.random.choice(n_rows, int(n_rows * 0.002), replace=False)
     for idx in mixed_cost_indices:
         original_cost = df_with_errors.loc[idx, 'transaction_cost']
@@ -535,12 +490,12 @@ def introduce_data_errors(df):
         if pd.notna(df_with_errors.loc[idx, 'description']):
             df_with_errors.loc[idx, 'description'] = f"  {df_with_errors.loc[idx, 'description']}  "
     
-    # 10. Invalid loan_id references (0.2% - reference non-existent loans)
+    # 10. Invalid loan_id references (0.2%)
     invalid_loan_indices = np.random.choice(n_rows, int(n_rows * 0.002), replace=False)
     for idx in invalid_loan_indices:
         df_with_errors.loc[idx, 'loan_id'] = f"INVALID_LOAN_{random.randint(1000, 9999)}"
     
-    # 11. Inconsistent boolean values (for immediate_payment column)
+    # 11. Inconsistent boolean values (for immediate_payment)
     if 'immediate_payment' in df_with_errors.columns:
         bool_indices = np.random.choice(n_rows, int(n_rows * 0.01), replace=False)
         bool_values = ['TRUE', 'FALSE', 'Yes', 'No', '1', '0', 'true', 'false']
@@ -624,10 +579,10 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Generate realistic loan payment transactions")
     parser.add_argument('--start_year', type=int, default=START_YEAR, help='Starting year for transaction generation')
-    parser.add_argument('--end_year', type=int, default=2024, help='Ending year for transaction generation (default: 2024)')
+    parser.add_argument('--end_year', type=int, default=2024, help='Ending year for transaction generation')
     
     args = parser.parse_args()
-    
+
     # Validate years
     if args.start_year > args.end_year:
         print("Error: start_year cannot be greater than end_year")
