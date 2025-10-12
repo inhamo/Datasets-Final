@@ -6,25 +6,32 @@ from datetime import datetime, timedelta
 import os
 from tqdm import tqdm
 import logging
+from collections import defaultdict
 from sa_merchant import (SA_COMPANIES, STATUS_WEIGHTS, PEAK_HOURS, WEEKEND_MULTIPLIERS,
                          PAYDAY_MULTIPLIERS, AGE_SPENDING_PREFERENCES, INCOME_SPENDING_MULTIPLIERS)
 
-# Initialize constants
+# Constants
 TRANSACTION_STATUSES = ['completed', 'failed', 'cancelled', 'pending']
-CHANNELS = ['pos', 'online banking', 'mobile banking app', 'branch']
+CHANNELS = ['pos', 'branch', 'atm', 'online banking', 'mobile banking app']
+FAKER = Faker('zu_ZA')
 
-# Initialize faker with South African locale
-fake = Faker('zu_ZA')
-
-# Set up logging
+# Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
-class BalanceTracker:
-    """Track running balances for all accounts considering all transaction types"""
-    
+class AccountBalanceManager:
+    """
+    Manages account balances, transaction history, and activation rules.
+    Enforces 7-day grace period after first credit before debits are allowed.
+    Handles account statuses: active (full), dormant/frozen (credits only), closed (none).
+    Tracks whether first transaction has occurred to control branch usage.
+    """
     def __init__(self):
-        self.account_balances = {}
+        self.balances = {}
+        self.histories = {}
+        self.first_credits = {}
+        self.pending_deposits = {}
+        self.first_transaction_done = {}  # Track if first transaction has occurred
         self.overdraft_limits = {
             'Premium Banking': -10000,
             'Gold Banking': -5000,
@@ -33,790 +40,1105 @@ class BalanceTracker:
             'Student Banking': -200,
             'Business Banking': -20000
         }
-    
-    def initialize_account_balance(self, account_id, account_type, initial_deposit=0):
-        """Initialize account with starting balance"""
-        self.account_balances[account_id] = {
-            'balance': initial_deposit,
-            'account_type': account_type,
-            'overdraft_limit': self.overdraft_limits.get(account_type, -1000)
+
+    def setup_account(self, account_id, account_type, initial_balance=0, open_date=None, status='active', status_change_date=None):
+        """Initialize an account with zero or initial balance."""
+        if open_date is None:
+            open_date = datetime(1900, 1, 1).date()
+        if status_change_date is None or pd.isna(status_change_date):
+            status_change_date = None
+        else:
+            status_change_date = pd.to_datetime(status_change_date).date()
+        self.balances[account_id] = {
+            'balance': initial_balance,
+            'type': account_type,
+            'overdraft': self.overdraft_limits.get(account_type, -1000),
+            'last_tx_time': datetime(1900, 1, 1),
+            'open_date': open_date,
+            'status': status,
+            'status_change_date': status_change_date,
+            'activated': initial_balance > 0
         }
-        logger.debug(f"Initialized account {account_id} with balance {initial_deposit}")
-    
-    def can_transact(self, account_id, amount):
-        """Check if account can handle the transaction"""
-        if account_id not in self.account_balances:
-            logger.warning(f"Account {account_id} not found in balance tracker")
+        self.histories[account_id] = []
+        self.first_transaction_done[account_id] = initial_balance > 0  # First tx done if initial balance exists
+        if initial_balance > 0 and open_date:
+            self.first_credits[account_id] = open_date
+        LOGGER.debug(f"Set up {account_id} with balance {initial_balance}, status {status}")
+
+    def get_status_at_date(self, account_id, check_date):
+        """Determine account status at a given date."""
+        if account_id not in self.balances:
+            return 'closed'
+        info = self.balances[account_id]
+        change_date = info['status_change_date']
+        if change_date and check_date >= change_date:
+            return info['status']
+        return 'active'
+
+    def is_transaction_allowed(self, account_id, is_debit, tx_date):
+        """Check if a transaction (debit or credit) is permissible based on status."""
+        status = self.get_status_at_date(account_id, tx_date)
+        if status == 'closed':
             return False
-        
-        current_balance = self.account_balances[account_id]['balance']
-        overdraft_limit = self.account_balances[account_id]['overdraft_limit']
-        return (current_balance - amount) >= overdraft_limit
-    
-    def process_transaction(self, account_id, amount, transaction_type='debit'):
-        """Process transaction and update balance"""
-        if account_id not in self.account_balances:
-            logger.warning(f"Cannot process transaction for unknown account {account_id}")
+        if is_debit and status in ['frozen', 'dormant']:
             return False
-        
-        if transaction_type == 'debit':
-            if not self.can_transact(account_id, amount):
-                logger.debug(f"Transaction failed: Insufficient funds for {account_id}, amount: {amount}")
-                return False
-            self.account_balances[account_id]['balance'] -= amount
-        else:  # credit
-            self.account_balances[account_id]['balance'] += amount
-        
-        logger.debug(f"Processed {transaction_type} transaction for {account_id}, amount: {amount}, new balance: {self.account_balances[account_id]['balance']}")
         return True
-    
-    def get_balance(self, account_id):
-        """Get current balance for account"""
-        if account_id not in self.account_balances:
-            logger.warning(f"Account {account_id} not found, returning balance 0")
-            return 0
-        return self.account_balances[account_id]['balance']
 
-def load_banking_data_for_year(year):
-    """Load banking data files for all years up to the specified year"""
-    accounts_dfs = []
-    customers_dfs = []
-    
-    for y in range(2018, year + 1):
-        try:
-            accounts_df = pd.read_parquet(f"banking_data/accounts_{y}.parquet")
-            customers_df = pd.read_parquet(f"banking_data/customers_{y}.parquet")
-            # Rename columns if necessary
-            customers_df = customers_df.rename(columns={'CustomerID': 'customer_id'})
-            # Generate synthetic data for missing customer columns
-            if 'age' not in customers_df.columns:
-                customers_df['age'] = np.random.randint(18, 80, size=len(customers_df))
-                logger.warning(f"Generated synthetic 'age' column for {y}")
-            if 'income' not in customers_df.columns:
-                customers_df['income'] = np.random.normal(25000, 8000, size=len(customers_df)).clip(min=4000)
-                logger.warning(f"Generated synthetic 'income' column for {y}")
-            if 'occupation' not in customers_df.columns:
-                customers_df['occupation'] = np.random.choice(['Employed', 'Self-Employed', 'Unemployed', 'Student'], size=len(customers_df))
-                logger.warning(f"Generated synthetic 'occupation' column for {y}")
-            accounts_dfs.append(accounts_df)
-            customers_dfs.append(customers_df)
-            logger.info(f"Loaded data for year {y}: {len(accounts_df)} accounts, {len(customers_df)} customers")
-        except FileNotFoundError as e:
-            logger.warning(f"Could not load data for {y}: {e}")
-            continue
-    
-    if accounts_dfs:
-        accounts_df = pd.concat(accounts_dfs, ignore_index=True)
-        accounts_df = accounts_df.sort_values(by="account_id").drop_duplicates(subset="account_id", keep="last")
-        logger.info(f"Total unique accounts loaded: {len(accounts_df)}")
-    else:
-        accounts_df = pd.DataFrame(columns=['account_id', 'customer_id', 'account_type'])
-        logger.warning("No account data found, using empty DataFrame")
-    
-    if customers_dfs:
-        customers_df = pd.concat(customers_dfs, ignore_index=True)
-        customers_df = customers_df.sort_values(by="customer_id").drop_duplicates(subset="customer_id", keep="last")
-        logger.info(f"Total unique customers loaded: {len(customers_df)}")
-    else:
-        customers_df = pd.DataFrame(columns=['customer_id', 'age', 'income', 'occupation'])
-        logger.warning("No customer data found, using empty DataFrame")
-    
-    # Validate required columns
-    required_account_cols = ['account_id', 'customer_id']
-    if not all(col in accounts_df.columns for col in required_account_cols):
-        logger.error("Missing required columns in accounts data")
-        return accounts_df, customers_df
-    
-    required_customer_cols = ['customer_id', 'age', 'income', 'occupation']
-    if not all(col in customers_df.columns for col in required_customer_cols):
-        logger.warning("Missing required columns in customers data, using synthetic data")
-        if 'customer_id' not in customers_df.columns and not accounts_df.empty:
-            customers_df = pd.DataFrame({
-                'customer_id': accounts_df['customer_id'].unique(),
-                'age': np.random.randint(18, 80, size=len(accounts_df['customer_id'].unique())),
-                'income': np.random.normal(25000, 8000, size=len(accounts_df['customer_id'].unique())).clip(min=4000),
-                'occupation': np.random.choice(['Employed', 'Self-Employed', 'Unemployed', 'Student'], size=len(accounts_df['customer_id'].unique()))
-            })
-    
-    # Add distress_level
-    if 'distress_level' not in customers_df.columns:
-        customers_df['distress_level'] = customers_df['income'].apply(
-            lambda inc: np.random.choice([0.0, 0.5, 0.8], p=[0.6, 0.3, 0.1]) if inc < 15000 else 
-                        np.random.choice([0.0, 0.5, 0.8], p=[0.8, 0.15, 0.05]) if inc > 40000 else 
-                        np.random.choice([0.0, 0.5, 0.8], p=[0.7, 0.25, 0.05])
+    def is_debit_allowed(self, account_id, amount, tx_date=None):
+        """Check if a debit transaction is permissible."""
+        if not self.is_transaction_allowed(account_id, True, tx_date):
+            return False
+        if account_id not in self.balances:
+            return False
+        info = self.balances[account_id]
+        if not info['activated']:
+            return False
+        if account_id in self.first_credits and tx_date:
+            days_passed = (tx_date - self.first_credits[account_id]).days
+            if days_passed < 7:
+                return False
+        projected_balance = info['balance'] - amount
+        return projected_balance >= info['overdraft']
+
+    def execute_tx(self, account_id, amount, is_debit=True, tx_time=None):
+        """Process a transaction and update balance."""
+        if account_id not in self.balances:
+            return False
+        if tx_time is None:
+            check_date = datetime.now().date()
+        else:
+            check_date = tx_time.date()
+        if not self.is_transaction_allowed(account_id, is_debit, check_date):
+            return False
+        info = self.balances[account_id]
+        tx_date = check_date
+        if is_debit:
+            if not self.is_debit_allowed(account_id, amount, tx_date):
+                return False
+            info['balance'] -= amount
+        else:
+            info['balance'] += amount
+            if not info['activated']:
+                info['activated'] = True
+                if tx_time and account_id not in self.first_credits:
+                    self.first_credits[account_id] = tx_time.date()
+        if tx_time:
+            info['last_tx_time'] = tx_time
+        self.histories[account_id].append({
+            'time': tx_time,
+            'direction': 'debit' if is_debit else 'credit',
+            'amount': amount
+        })
+        self.first_transaction_done[account_id] = True  # Mark first transaction done
+        LOGGER.debug(f"Executed {'debit' if is_debit else 'credit'} of {amount} for {account_id}; balance now {info['balance']}")
+        return True
+
+    def current_balance(self, account_id):
+        """Retrieve current balance for an account."""
+        return self.balances.get(account_id, {}).get('balance', 0)
+
+class FraudInjector:
+    """
+    Handles selection and injection of fraud patterns into transactions.
+    """
+    def __init__(self, year):
+        self.year = year
+        self.suspect_accounts = set()
+        self.smurfing_accounts = []
+        self.high_velocity_accounts = []
+        self.cycle_pairs = []
+        self.reactivated_dormants = []
+
+    def pick_suspects(self, accounts_df, customers_df):
+        """Randomly select accounts for fraud types."""
+        merged = accounts_df.merge(customers_df, on='customer_id', how='left')
+        merged = merged[~(merged['status'] == 'closed') | merged['status_change_date'].isna()]
+        total_accounts = len(merged)
+
+        smurf_count = max(3, int(total_accounts * 0.025))
+        self.smurfing_accounts = merged.sample(n=smurf_count)['account_id'].tolist()
+
+        velocity_count = max(2, int(total_accounts * 0.01))
+        remaining = merged[~merged['account_id'].isin(self.smurfing_accounts)]
+        if len(remaining) >= velocity_count:
+            self.high_velocity_accounts = remaining.sample(n=velocity_count)['account_id'].tolist()
+
+        pair_count = max(2, int(total_accounts * 0.008))
+        further_remaining = remaining[~remaining['account_id'].isin(self.high_velocity_accounts)]
+        if len(further_remaining) >= pair_count * 2:
+            sampled = further_remaining.sample(n=pair_count * 2)
+            self.cycle_pairs = [(sampled.iloc[i]['account_id'], sampled.iloc[i + 1]['account_id'])
+                                for i in range(0, len(sampled) - 1, 2)]
+
+        dormant_count = max(2, int(total_accounts * 0.005))
+        final_remaining = further_remaining[~further_remaining['account_id'].isin(
+            [acc for pair in self.cycle_pairs for acc in pair]
+        )]
+        if len(final_remaining) >= dormant_count:
+            self.reactivated_dormants = final_remaining.sample(n=dormant_count)['account_id'].tolist()
+
+        self.suspect_accounts = set(
+            self.smurfing_accounts + self.high_velocity_accounts +
+            [acc for pair in self.cycle_pairs for acc in pair] + self.reactivated_dormants
         )
-        logger.warning(f"Generated synthetic 'distress_level' column for {year}")
-    
-    return accounts_df, customers_df
+        LOGGER.info(f"Fraud selection: Smurfing {len(self.smurfing_accounts)}, Velocity {len(self.high_velocity_accounts)}, "
+                    f"Pairs {len(self.cycle_pairs)}, Dormants {len(self.reactivated_dormants)}")
 
-def load_existing_transactions(year, accounts_df):
-    """Load existing loan and debit order transactions for a specific year, filtered by valid accounts"""
+def fetch_data_up_to_year(target_year):
+    """Load and merge accounts and customers data from 2018 to target_year."""
+    account_frames = []
+    customer_frames = []
+    for yr in range(2018, target_year + 1):
+        try:
+            acc_df = pd.read_parquet(f"banking_data/accounts_{yr}.parquet")
+            cust_df = pd.read_parquet(f"banking_data/customers_{yr}.parquet")
+            cust_df.rename(columns={'CustomerID': 'customer_id'}, inplace=True)
+            if 'age' not in cust_df:
+                cust_df['age'] = np.random.randint(18, 80, len(cust_df))
+            if 'income' not in cust_df:
+                cust_df['income'] = np.maximum(4000, np.random.normal(25000, 8000, len(cust_df)))
+            if 'occupation' not in cust_df:
+                cust_df['occupation'] = np.random.choice(['Employed', 'Self-Employed', 'Unemployed', 'Student'], len(cust_df))
+            if 'distress_level' not in cust_df:
+                def distress_calc(inc):
+                    if inc < 15000:
+                        return np.random.choice([0.0, 0.5, 0.8], p=[0.6, 0.3, 0.1])
+                    elif inc > 40000:
+                        return np.random.choice([0.0, 0.5, 0.8], p=[0.8, 0.15, 0.05])
+                    else:
+                        return np.random.choice([0.0, 0.5, 0.8], p=[0.7, 0.25, 0.05])
+                cust_df['distress_level'] = cust_df['income'].apply(distress_calc)
+            if 'online_banking_enabled' not in acc_df:
+                acc_df['online_banking_enabled'] = np.random.choice([0, 1], len(acc_df), p=[0.3, 0.7])
+            account_frames.append(acc_df)
+            customer_frames.append(cust_df)
+            LOGGER.info(f"Loaded {len(acc_df)} accounts and {len(cust_df)} customers for {yr}")
+        except FileNotFoundError:
+            LOGGER.warning(f"Missing data for {yr}")
+            continue
+
+    if account_frames:
+        accounts = pd.concat(account_frames, ignore_index=True).sort_values('account_id').drop_duplicates('account_id', keep='last')
+    else:
+        accounts = pd.DataFrame(columns=['account_id', 'customer_id', 'account_type', 'online_banking_enabled'])
+
+    if customer_frames:
+        customers = pd.concat(customer_frames, ignore_index=True).sort_values('customer_id').drop_duplicates('customer_id', keep='last')
+    else:
+        customers = pd.DataFrame(columns=['customer_id', 'age', 'income', 'occupation', 'distress_level'])
+
+    if 'status' not in accounts.columns:
+        accounts['status'] = np.random.choice(['active', 'dormant', 'frozen', 'closed'], len(accounts), p=[0.85, 0.05, 0.03, 0.07])
+    if 'status_change_date' not in accounts.columns:
+        accounts['status_change_date'] = pd.NaT
+        mask = accounts['status'] != 'active'
+        if mask.sum() > 0:
+            for idx in accounts[mask].index:
+                open_d = accounts.at[idx, 'opening_date']
+                if pd.isna(open_d):
+                    continue
+                open_d = pd.to_datetime(open_d, errors='coerce').date()
+                months_after = random.randint(1, 24)
+                change_d = open_d + pd.DateOffset(months=months_after)
+                accounts.at[idx, 'status_change_date'] = change_d
+    accounts['opening_date'] = pd.to_datetime(accounts['opening_date'], errors='coerce')
+    accounts['status_change_date'] = pd.to_datetime(accounts['status_change_date'], errors='coerce')
+
+    return accounts, customers
+
+def load_scheduled_txs(year, accounts):
+    """Load loan payments and debit orders for the year."""
     try:
-        loan_transactions_df = pd.read_parquet("banking_data/loan_payment_transactions_2018.parquet", engine="fastparquet")
-        debit_order_transactions_df = pd.read_parquet("banking_data/debit_order_transactions_2018.parquet", engine="fastparquet")
-        
-        # Filter by year and valid account_ids
-        valid_account_ids = set(accounts_df['account_id'])
-        loan_transactions_df = loan_transactions_df[
-            (loan_transactions_df['transaction_date'].str.startswith(str(year))) &
-            (loan_transactions_df['account_id'].isin(valid_account_ids))
-        ]
-        debit_order_transactions_df = debit_order_transactions_df[
-            (debit_order_transactions_df['transaction_date'].str.startswith(str(year))) &
-            (debit_order_transactions_df['account_id'].isin(valid_account_ids))
-        ]
-        
-        # Log any invalid account_ids
-        if not loan_transactions_df.empty:
-            invalid_loan_accounts = set(loan_transactions_df['account_id'].unique()) - valid_account_ids
-            if invalid_loan_accounts:
-                logger.warning(f"Found {len(invalid_loan_accounts)} invalid account IDs in loan transactions: {list(invalid_loan_accounts)[:10]}")
-        
-        if not debit_order_transactions_df.empty:
-            invalid_debit_accounts = set(debit_order_transactions_df['account_id'].unique()) - valid_account_ids
-            if invalid_debit_accounts:
-                logger.warning(f"Found {len(invalid_debit_accounts)} invalid account IDs in debit order transactions: {list(invalid_debit_accounts)[:10]}")
-        
-        logger.info(f"Loaded {len(loan_transactions_df)} loan transactions and {len(debit_order_transactions_df)} debit order transactions for {year}")
-        return loan_transactions_df, debit_order_transactions_df
-    except FileNotFoundError as e:
-        logger.warning(f"Could not load existing transactions: {e}")
+        loans = pd.read_parquet(f"banking_data/loan_payment_transactions_{year}.parquet", engine='fastparquet')
+        debits = pd.read_parquet(f"banking_data/debit_order_transactions_{year}.parquet", engine='fastparquet')
+        loans.drop(columns=['loan_type'], errors='ignore', inplace=True)
+        debits.drop(columns=['payment_type'], errors='ignore', inplace=True)
+        valid_ids = set(accounts['account_id'])
+        loans = loans[loans['account_id'].isin(valid_ids)]
+        debits = debits[debits['account_id'].isin(valid_ids)]
+        LOGGER.info(f"Loaded {len(loans)} loans and {len(debits)} debits for {year}")
+        return loans, debits
+    except FileNotFoundError:
+        LOGGER.warning(f"No scheduled transactions found for {year}")
         return pd.DataFrame(), pd.DataFrame()
 
-def preprocess_scheduled_transactions(balance_tracker, loan_transactions_df, debit_order_transactions_df):
-    """Pre-process all scheduled transactions to update balances chronologically"""
-    logger.info("Pre-processing scheduled transactions for balance tracking...")
-    
-    all_scheduled = []
-    
-    if not loan_transactions_df.empty:
-        loan_copy = loan_transactions_df.copy()
-        loan_copy['transaction_datetime'] = pd.to_datetime(
-            loan_copy['transaction_date'] + ' ' + 
-            loan_copy.get('transaction_time', '09:00:00')
-        )
-        all_scheduled.append(loan_copy[['account_id', 'amount', 'debit_credit', 'transaction_datetime']])
-    
-    if not debit_order_transactions_df.empty:
-        debit_copy = debit_order_transactions_df.copy()
-        debit_copy['transaction_datetime'] = pd.to_datetime(
-            debit_copy['transaction_date'] + ' ' + 
-            debit_copy.get('transaction_time', '06:00:00')
-        )
-        all_scheduled.append(debit_copy[['account_id', 'amount', 'debit_credit', 'transaction_datetime']])
-    
-    if all_scheduled:
-        combined_scheduled = pd.concat(all_scheduled, ignore_index=True)
-        combined_scheduled = combined_scheduled.sort_values('transaction_datetime')
-        
-        # Log unique account IDs
-        logger.info(f"Processing {len(combined_scheduled)} scheduled transactions for {len(combined_scheduled['account_id'].unique())} unique accounts")
-        
-        for _, row in combined_scheduled.iterrows():
-            if row['account_id'] not in balance_tracker.account_balances:
-                logger.warning(f"Skipping transaction for uninitialized account {row['account_id']}")
-                continue
-            if row['debit_credit'] == 'debit':
-                balance_tracker.process_transaction(row['account_id'], row['amount'], 'debit')
-            else:
-                balance_tracker.process_transaction(row['account_id'], row['amount'], 'credit')
+def pick_merchant(cat, count=1):
+    """Select merchant details for a category."""
+    cat_lower = cat.lower()
+    if cat_lower not in SA_COMPANIES:
+        base_merch = {'name': FAKER.company(), 'size': 'medium', 'avg_transaction': 200, 'std_deviation': 60,
+                      'hours': {'open': 8, 'close': 20}}
+        return [base_merch] * count
+    merchants = SA_COMPANIES[cat_lower]
+    indices = np.random.choice(len(merchants), count, replace=True)
+    return [merchants[i] for i in indices]
 
-def generate_sa_phone_number(size=1):
-    """Generate South African phone numbers efficiently"""
-    prefixes = np.array(['082', '083', '084', '072', '073', '074', '076', '078', '079', '081', '071'])
-    prefixes_selected = np.random.choice(prefixes, size=size)
-    numbers = np.random.randint(0, 10000000, size=size)
-    numbers_str = np.char.zfill(numbers.astype(str), 7)
-    return np.char.add(prefixes_selected, numbers_str)
-
-def get_merchant_info(category, size=1):
-    """Get merchant information based on category"""
-    if category.lower() not in SA_COMPANIES:
-        logger.warning(f"Category {category} not found, using default merchant")
-        return [{"name": fake.company(), "size": "medium", "avg_transaction": 200, "std_deviation": 60, "hours": {"open": 8, "close": 20}}] * size
-    
-    merchants = SA_COMPANIES[category.lower()]
-    selected = np.random.choice(len(merchants), size=size, replace=True)
-    return [merchants[i] for i in selected]
-
-def get_age_group(age):
-    """Categorize customer by age group"""
+def age_bucket(age):
+    """Map age to spending preference group."""
     if pd.isna(age):
-        return '26-35'  # Default to middle age group
-    age = int(age)
-    if age < 26:
-        return '18-25'
-    elif age < 36:
         return '26-35'
-    elif age < 51:
-        return '36-50'
-    elif age < 66:
-        return '51-65'
-    else:
-        return '65+'
+    age_int = int(age)
+    if age_int < 26: return '18-25'
+    if age_int < 36: return '26-35'
+    if age_int < 51: return '36-50'
+    if age_int < 66: return '51-65'
+    return '65+'
 
-def get_income_category(income):
-    """Categorize customer by income level"""
-    if pd.isna(income):
-        return 'medium'  # Default to medium income
-    income = float(income)
-    if income < 15000:
-        return 'low'
-    elif income < 40000:
+def income_tier(inc):
+    """Map income to spending tier."""
+    if pd.isna(inc):
         return 'medium'
-    elif income < 80000:
-        return 'high'
-    else:
-        return 'premium'
+    inc_float = float(inc)
+    if inc_float < 15000: return 'low'
+    if inc_float < 40000: return 'medium'
+    if inc_float < 80000: return 'high'
+    return 'premium'
 
-def calculate_transaction_amount(merchant_info, customer_age, customer_income, category, distress_level=0.0):
-    """Calculate realistic transaction amount based on merchant, customer profile"""
-    base_amount = np.random.normal(
-        merchant_info['avg_transaction'], 
-        merchant_info.get('std_deviation', merchant_info['avg_transaction'] * 0.3)
-    )
-    
-    age_group = get_age_group(customer_age)
-    age_multiplier = AGE_SPENDING_PREFERENCES.get(age_group, {}).get(category, 1.0)
-    
-    income_category = get_income_category(customer_income)
-    income_multipliers = INCOME_SPENDING_MULTIPLIERS.get(income_category, {'normal': 1.0, 'distressed': 0.6, 'categories': {}})
-    
-    distress_weight = distress_level
-    normal_weight = 1.0 - distress_weight
-    income_multiplier = normal_weight * income_multipliers['normal'] + distress_weight * income_multipliers['distressed']
-    
-    category_multiplier = income_multipliers['categories'].get(category, income_multiplier)
-    
-    final_amount = max(10, base_amount * age_multiplier * category_multiplier)
-    return round(final_amount, 2)
+def compute_amount(merchant, age, income, cat, distress=0.0):
+    """Generate realistic transaction amount based on factors."""
+    base = np.random.normal(merchant['avg_transaction'], merchant.get('std_deviation', merchant['avg_transaction'] * 0.3))
+    age_grp = age_bucket(age)
+    age_mult = AGE_SPENDING_PREFERENCES.get(age_grp, {}).get(cat, 1.0)
+    inc_grp = income_tier(income)
+    inc_mults = INCOME_SPENDING_MULTIPLIERS.get(inc_grp, {'normal': 1.0, 'distressed': 0.6, 'categories': {}})
+    norm_wt = 1.0 - distress
+    base_inc_mult = norm_wt * inc_mults['normal'] + distress * inc_mults['distressed']
+    cat_mult = inc_mults['categories'].get(cat, base_inc_mult)
+    final = max(10, base * age_mult * cat_mult)
+    return round(final, 2)
 
-def get_transaction_status_weighted(merchant_size, date_obj, distress_level=0.0):
-    """Get transaction status based on merchant size and date"""
-    weights = STATUS_WEIGHTS.get(merchant_size, STATUS_WEIGHTS['medium']).copy()
-    
-    if distress_level > 0.5:
-        weights['failed'] = min(0.1, weights['failed'] * (1 + distress_level))
-        weights['cancelled'] = min(0.1, weights['cancelled'] * (1 + distress_level))
-        weights['completed'] = 1 - (weights['cancelled'] + weights['failed'] + weights['pending'])
-    
-    if date_obj.weekday() >= 5:  # Weekend
-        weights['failed'] = min(0.08, weights['failed'] * 1.5)
-        weights['completed'] = 1 - (weights['cancelled'] + weights['failed'] + weights['pending'])
-    
-    statuses = list(weights.keys())
-    probabilities = list(weights.values())
-    return np.random.choice(statuses, p=probabilities)
+def add_errors(tx_dict):
+    """Occasionally introduce data quality issues."""
+    if random.random() < 0.02:
+        err_type = random.choice(['missing_field', 'wrong_status', 'timestamp_error'])
+        if err_type == 'missing_field':
+            if random.random() < 0.5:
+                tx_dict['merchant_name'] = None
+            else:
+                tx_dict['description'] = None
+        elif err_type == 'wrong_status':
+            if tx_dict['status'] == 'completed':
+                tx_dict['status'] = 'pending'
+        elif err_type == 'timestamp_error':
+            tx_dict['transaction_time'] = '00:00:00'
+    return tx_dict
 
-def is_merchant_open(merchant_info, hour):
-    """Check if merchant is open at given hour"""
-    hours = merchant_info.get('hours', {'open': 8, 'close': 20})
-    open_hour = hours['open']
-    close_hour = hours['close']
-    
-    if close_hour == 24 or close_hour == 0:
-        return True
-    elif close_hour < open_hour:
-        return hour >= open_hour or hour <= close_hour
-    else:
-        return open_hour <= hour < close_hour
+def get_available_channels(account_id, accounts_df):
+    """Determine available channels based on online_banking_enabled."""
+    acc = accounts_df[accounts_df['account_id'] == account_id]
+    if acc.empty or acc['online_banking_enabled'].iloc[0] == 0:
+        return ['pos', 'branch', 'atm']
+    return CHANNELS
 
-def generate_realistic_time(category, date_obj):
-    """Generate realistic transaction time based on category artiste day"""
-    peak_hours = PEAK_HOURS.get(category, [12, 13, 17, 18])
-    
-    if date_obj.weekday() >= 5 and category in ['entertainment', 'restaurants', 'alcohol']:
-        peak_hours = [min(h + 2, 23) for h in peak_hours]
-    
-    hour = np.random.choice(peak_hours) if random.random() < 0.6 else np.random.randint(8, 22)
-    minute = np.random.randint(0, 60)
-    second = np.random.randint(0, 60)
-    
-    return f"{hour:02d}:{minute:02d}:{second:02d}"
+def create_smurfing_txs(account_id, base_date, tx_id_start, year, manager, accounts_df):
+    """Generate multiple cash deposits with varied amounts below reporting threshold."""
+    txs = []
+    num_txs = random.randint(1, 3)
+    threshold = 50000
+    available_channels = get_available_channels(account_id, accounts_df)
+    for i in range(num_txs):
+        offset_days = random.randint(-7, 7)
+        dep_date = base_date + timedelta(days=offset_days)
+        hr = random.randint(9, 16)
+        mn = random.randint(0, 59)
+        tme = f"{hr:02d}:{mn:02d}:00"
+        amt = round(random.uniform(threshold * 0.50, threshold * 0.95), 2)
+        channel = 'branch' if not manager.first_transaction_done.get(account_id, False) else random.choice(available_channels)
+        tx_cost = round(random.uniform(10, 50), 2) if channel in ['branch', 'atm'] else 0.0
+        tx = {
+            'transaction_id': f"TXN{year}{tx_id_start + i:06d}",
+            'account_id': account_id,
+            'transaction_date': dep_date.strftime('%Y-%m-%d'),
+            'transaction_time': tme,
+            'amount': amt,
+            'debit_credit': 'credit',
+            'category': 'cash deposit',
+            'status': 'completed',
+            'description': 'Cash deposit',
+            'immediate_payment': False,
+            'receiving_account': account_id,
+            'receiving_bank': 'Same Bank',
+            'transaction_cost': tx_cost,
+            'channel': channel,
+            'merchant_name': ''
+        }
+        dt = pd.to_datetime(dep_date.strftime('%Y-%m-%d') + ' ' + tme)
+        if manager.execute_tx(account_id, amt, False, dt):
+            txs.append(add_errors(tx))
+            if random.random() < 0.5:
+                merch = pick_merchant('retail')[0]
+                debit_amt = compute_amount(merch, 30, 25000, 'retail', 0.0)
+                debit_time = f"{hr + 1:02d}:{random.randint(0, 59):02d}:00"
+                debit_dt = pd.to_datetime(dep_date.strftime('%Y-%m-%d') + ' ' + debit_time)
+                if manager.is_debit_allowed(account_id, debit_amt, debit_dt.date()):
+                    manager.execute_tx(account_id, debit_amt, True, debit_dt)
+                    debit_tx = {
+                        'transaction_id': f"TXN{year}{tx_id_start + i + 1:06d}",
+                        'account_id': account_id,
+                        'transaction_date': dep_date.strftime('%Y-%m-%d'),
+                        'transaction_time': debit_time,
+                        'amount': debit_amt,
+                        'debit_credit': 'debit',
+                        'category': 'retail',
+                        'status': 'completed',
+                        'description': f"Purchase at {merch['name']}",
+                        'immediate_payment': False,
+                        'receiving_account': '',
+                        'receiving_bank': '',
+                        'transaction_cost': 0.0,
+                        'channel': random.choice(available_channels),
+                        'merchant_name': merch['name']
+                    }
+                    txs.append(add_errors(debit_tx))
+                    i += 1
+    return txs, len(txs)
 
-def generate_alcohol_transactions(eligible_accounts, customers_df, balance_tracker, 
-                                 single_date, txn_counter, year):
-    """Generate alcohol purchases on drinking days (Thu-Sun)"""
-    if single_date.weekday() not in [3, 4, 5, 6]:
-        return pd.DataFrame(), txn_counter
-    
-    acc_cust = eligible_accounts.merge(customers_df, on="customer_id", how="left")
-    
-    drinking_customers = acc_cust[
-        (acc_cust['age'] >= 18) & 
-        (acc_cust['occupation'] != 'Student') &
-        (acc_cust['age'] <= 65)
+def create_velocity_burst(account_id, base_date, manager, tx_id_start, year, accounts_df):
+    """Generate rapid-fire transactions."""
+    txs = []
+    num_txs = random.randint(8, 15)
+    start_hr = random.randint(10, 18)
+    available_channels = get_available_channels(account_id, accounts_df)
+    for i in range(num_txs):
+        mins = random.randint(0, 119)
+        hr = start_hr + (mins // 60)
+        mnt = mins % 60
+        sec = random.randint(0, 59)
+        tme = f"{hr:02d}:{mnt:02d}:{sec:02d}"
+        amt = round(random.uniform(500, 2500), 2)
+        merch = pick_merchant(random.choice(['retail', 'electronics']))[0]
+        dt = pd.to_datetime(base_date.strftime('%Y-%m-%d') + ' ' + tme)
+        status = 'failed'
+        if manager.is_debit_allowed(account_id, amt, dt.date()):
+            status = random.choices(['completed', 'failed'], weights=[0.75, 0.25])[0]
+            if status == 'completed':
+                manager.execute_tx(account_id, amt, True, dt)
+        channel = random.choice(available_channels)
+        tx = {
+            'transaction_id': f"TXN{year}{tx_id_start + i:06d}",
+            'account_id': account_id,
+            'transaction_date': base_date.strftime('%Y-%m-%d'),
+            'transaction_time': tme,
+            'amount': amt,
+            'debit_credit': 'debit',
+            'category': 'retail',
+            'status': status,
+            'description': f"Purchase at {merch['name']}",
+            'immediate_payment': False,
+            'receiving_account': '',
+            'receiving_bank': '',
+            'transaction_cost': 0.0,
+            'channel': channel,
+            'merchant_name': merch['name']
+        }
+        txs.append(add_errors(tx))
+    return txs, len(txs)
+
+def create_cycle_txs(pair, base_date, manager, tx_id_start, year, accounts_df):
+    """Generate back-and-forth transfers between accounts."""
+    acc1, acc2 = pair
+    txs = []
+    amt = round(random.uniform(25000, 75000), 2)
+    tme1 = f"{random.randint(9, 12):02d}:{random.randint(0, 59):02d}:00"
+    dt1 = pd.to_datetime(base_date.strftime('%Y-%m-%d') + ' ' + tme1)
+    available_channels_acc1 = get_available_channels(acc1, accounts_df)
+    if manager.is_debit_allowed(acc1, amt, dt1.date()):
+        manager.execute_tx(acc1, amt, True, dt1)
+        manager.execute_tx(acc2, amt, False, dt1)
+        channel = random.choice(available_channels_acc1)
+        tx1 = {
+            'transaction_id': f"TXN{year}{tx_id_start:06d}",
+            'account_id': acc1,
+            'transaction_date': base_date.strftime('%Y-%m-%d'),
+            'transaction_time': tme1,
+            'amount': amt,
+            'debit_credit': 'debit',
+            'category': 'transfer',
+            'status': 'completed',
+            'description': 'Transfer to account',
+            'immediate_payment': True,
+            'receiving_account': acc2,
+            'receiving_bank': 'Same Bank',
+            'transaction_cost': 5.50,
+            'channel': channel,
+            'merchant_name': ''
+        }
+        txs.append(add_errors(tx1))
+    offset = random.randint(1, 2)
+    ret_date = base_date + timedelta(days=offset)
+    tme2 = f"{random.randint(13, 17):02d}:{random.randint(0, 59):02d}:00"
+    ret_amt = round(amt - random.uniform(50, 200), 2)
+    dt2 = pd.to_datetime(ret_date.strftime('%Y-%m-%d') + ' ' + tme2)
+    available_channels_acc2 = get_available_channels(acc2, accounts_df)
+    if manager.is_debit_allowed(acc2, ret_amt, dt2.date()):
+        manager.execute_tx(acc2, ret_amt, True, dt2)
+        manager.execute_tx(acc1, ret_amt, False, dt2)
+        channel = random.choice(available_channels_acc2)
+        tx2 = {
+            'transaction_id': f"TXN{year}{tx_id_start + 1:06d}",
+            'account_id': acc2,
+            'transaction_date': ret_date.strftime('%Y-%m-%d'),
+            'transaction_time': tme2,
+            'amount': ret_amt,
+            'debit_credit': 'debit',
+            'category': 'transfer',
+            'status': 'completed',
+            'description': 'Transfer to account',
+            'immediate_payment': True,
+            'receiving_account': acc1,
+            'receiving_bank': 'Same Bank',
+            'transaction_cost': 5.50,
+            'channel': channel,
+            'merchant_name': ''
+        }
+        txs.append(add_errors(tx2))
+    return txs, len(txs)
+
+def create_dormant_spike(account_id, base_date, manager, tx_id_start, year, accounts_df):
+    """Simulate sudden activity on inactive account."""
+    txs = []
+    cred_amt = round(random.uniform(50000, 150000), 2)
+    tme_cred = f"{random.randint(9, 11):02d}:{random.randint(0, 59):02d}:00"
+    dt_cred = pd.to_datetime(base_date.strftime('%Y-%m-%d') + ' ' + tme_cred)
+    available_channels = get_available_channels(account_id, accounts_df)
+    channel = 'branch' if not manager.first_transaction_done.get(account_id, False) else random.choice(available_channels)
+    tx_cost = round(random.uniform(10, 50), 2) if channel in ['branch', 'atm'] else 0.0
+    if manager.execute_tx(account_id, cred_amt, False, dt_cred):
+        tx_cred = {
+            'transaction_id': f"TXN{year}{tx_id_start:06d}",
+            'account_id': account_id,
+            'transaction_date': base_date.strftime('%Y-%m-%d'),
+            'transaction_time': tme_cred,
+            'amount': cred_amt,
+            'debit_credit': 'credit',
+            'category': 'transfer',
+            'status': 'completed',
+            'description': 'Transfer from another account',
+            'immediate_payment': True,
+            'receiving_account': account_id,
+            'receiving_bank': 'Same Bank',
+            'transaction_cost': tx_cost,
+            'channel': channel,
+            'merchant_name': ''
+        }
+        txs.append(add_errors(tx_cred))
+    num_spends = random.randint(3, 5)
+    for i in range(num_spends):
+        spend_amt = round(random.uniform(1000, 10000), 2)
+        tme_spend = f"{random.randint(12, 18):02d}:{random.randint(0, 59):02d}:00"
+        dt_spend = pd.to_datetime(base_date.strftime('%Y-%m-%d') + ' ' + tme_spend)
+        status = 'failed'
+        if manager.is_debit_allowed(account_id, spend_amt, dt_spend.date()):
+            status = 'completed'
+            manager.execute_tx(account_id, spend_amt, True, dt_spend)
+        merch = pick_merchant(random.choice(['retail', 'electronics']))[0]
+        channel = random.choice(available_channels)
+        tx_spend = {
+            'transaction_id': f"TXN{year}{tx_id_start + 1 + i:06d}",
+            'account_id': account_id,
+            'transaction_date': base_date.strftime('%Y-%m-%d'),
+            'transaction_time': tme_spend,
+            'amount': spend_amt,
+            'debit_credit': 'debit',
+            'category': 'retail',
+            'status': status,
+            'description': f"Purchase at {merch['name']}",
+            'immediate_payment': False,
+            'receiving_account': '',
+            'receiving_bank': '',
+            'transaction_cost': 0.0,
+            'channel': channel,
+            'merchant_name': merch['name']
+        }
+        txs.append(add_errors(tx_spend))
+    return txs, len(txs)
+
+def get_account_info(accounts_df, acc_id):
+    """Extract account info with defaults."""
+    acc = accounts_df[accounts_df['account_id'] == acc_id]
+    if acc.empty:
+        return 'Standard Banking', pd.to_datetime('1900-01-01'), 'active', pd.NaT, 0
+    row = acc.iloc[0]
+    atype = row.get('account_type', 'Standard Banking')
+    odate = pd.to_datetime(row.get('opening_date', '1900-01-01'), errors='coerce')
+    status = row.get('status', 'active')
+    scdate = pd.to_datetime(row.get('status_change_date'), errors='coerce')
+    online_enabled = row.get('online_banking_enabled', 0)
+    return atype, odate.date() if not pd.isna(odate) else datetime(1900, 1, 1).date(), status, scdate, online_enabled
+
+def produce_category_txs(cat, active_accs, custs, manager, date, count, tx_id, year, fraudster, accs):
+    """Generate transactions for a specific category."""
+    tx_list = []
+    success_count = 0
+    is_weekend = date.weekday() >= 5
+    is_payday = date.day in [25, 26, 27, 28]
+    merged = active_accs.merge(custs, on='customer_id', how='left')
+    if merged.empty:
+        return pd.DataFrame(), tx_id
+    sample_size = min(count, len(merged))
+    if sample_size == 0:
+        return pd.DataFrame(), tx_id
+    sel_accs = merged.sample(sample_size)
+    for _, row in sel_accs.iterrows():
+        acc_id = row['account_id']
+        age = row.get('age', 30)
+        income = row.get('income', 25000)
+        distress = row.get('distress_level', 0.0)
+        if acc_id not in manager.balances:
+            atype, odate, status, scdate, _ = get_account_info(accs, acc_id)
+            manager.setup_account(acc_id, atype, 0, odate, status, scdate)
+        merch = pick_merchant(cat)[0]
+        
+        # Get peak hours for this category, or use default business hours
+        peak_hours = PEAK_HOURS.get(cat, list(range(9, 18)))
+        
+        # Sample an hour from the peak hours for this category
+        hr = random.choice(peak_hours)
+        
+        tme = f"{int(hr):02d}:{random.randint(0, 59):02d}:00"
+        amt = compute_amount(merch, age, income, cat, distress)
+        mult = 1.0
+        if is_weekend:
+            mult *= WEEKEND_MULTIPLIERS.get(cat, 1.0)
+        if is_payday:
+            mult *= PAYDAY_MULTIPLIERS.get(cat, 1.0)
+        amt = round(amt * mult, 2)
+        imm = random.random() < 0.3
+        status = random.choices(TRANSACTION_STATUSES, weights=STATUS_WEIGHTS.get(cat, [0.9, 0.05, 0.03, 0.02]))[0]
+        available_channels = get_available_channels(acc_id, accs)
+        channel = 'branch' if not manager.first_transaction_done.get(acc_id, False) else random.choice(available_channels)
+        tx_cost = round(random.uniform(10, 50), 2) if channel in ['branch', 'atm'] else 0.0
+        dt = pd.to_datetime(date.strftime('%Y-%m-%d') + ' ' + tme)
+        if status == 'completed' and manager.is_debit_allowed(acc_id, amt, dt.date()):
+            manager.execute_tx(acc_id, amt, True, dt)
+        else:
+            status = 'failed'
+        tx = {
+            'transaction_id': f"TXN{year}{tx_id + success_count:06d}",
+            'account_id': acc_id,
+            'transaction_date': date.strftime('%Y-%m-%d'),
+            'transaction_time': tme,
+            'amount': amt,
+            'debit_credit': 'debit',
+            'category': cat,
+            'status': status,
+            'description': f"Purchase at {merch['name']}",
+            'immediate_payment': imm,
+            'receiving_account': '',
+            'receiving_bank': '',
+            'transaction_cost': tx_cost,
+            'channel': channel,
+            'merchant_name': merch['name']
+        }
+        tx_list.append(add_errors(tx))
+        success_count += 1
+    if tx_list:
+        df = pd.DataFrame(tx_list)
+        return df, tx_id + success_count
+    return pd.DataFrame(), tx_id
+
+def generate_salaries(active_accs, custs, manager, date, tx_id, year, accs):
+    """Create salary credits on the 25th."""
+    if date.day != 25:
+        return pd.DataFrame(), tx_id
+    merged = active_accs.merge(custs, on='customer_id', how='left')
+    if merged.empty:
+        return pd.DataFrame(), tx_id
+    workers = merged[merged['occupation'] != 'Unemployed']
+    if workers.empty:
+        return pd.DataFrame(), tx_id
+    num_sal = int(len(workers) * 0.8)
+    sel_workers = workers.sample(num_sal)
+    tx_list = []
+    for i, (_, worker) in enumerate(sel_workers.iterrows()):
+        base_sal = max(4000, abs(worker.get('income', np.random.normal(25000, 8000))))
+        mon_sal = max(4000, np.random.normal(base_sal, base_sal * 0.2))
+        acc_id = worker['account_id']
+        if acc_id not in manager.balances:
+            atype, odate, status, scdate, _ = get_account_info(accs, acc_id)
+            manager.setup_account(acc_id, atype, 0, odate, status, scdate)
+        tme = f"{random.randint(6, 10):02d}:00:00"
+        dt = pd.to_datetime(date.strftime('%Y-%m-%d') + ' ' + tme)
+        available_channels = get_available_channels(acc_id, accs)
+        channel = random.choice(available_channels)
+        tx_cost = round(random.uniform(10, 50), 2) if channel in ['branch', 'atm'] else 0.0
+        if manager.execute_tx(acc_id, mon_sal, False, dt):
+            tx = {
+                'transaction_id': f"TXN{year}{tx_id + i:06d}",
+                'account_id': acc_id,
+                'transaction_date': date.strftime('%Y-%m-%d'),
+                'transaction_time': tme,
+                'amount': round(mon_sal, 2),
+                'debit_credit': 'credit',
+                'category': 'salary payment',
+                'status': 'completed',
+                'description': 'Monthly salary',
+                'immediate_payment': False,
+                'receiving_account': acc_id,
+                'receiving_bank': 'Same Bank',
+                'transaction_cost': tx_cost,
+                'channel': channel,
+                'merchant_name': ''
+            }
+            tx_list.append(add_errors(tx))
+    return pd.DataFrame(tx_list), tx_id + len(tx_list)
+
+def generate_corp_payrolls(active_accs, custs, manager, date, tx_id, year, accs):
+    """Handle business payroll debits on the 25th."""
+    if date.day != 25:
+        return pd.DataFrame(), tx_id
+    corps = active_accs[
+        active_accs['customer_id'].str.startswith(('COM', 'SUB-COM'))
     ]
-    
-    if drinking_customers.empty:
-        logger.debug(f"No eligible customers for alcohol transactions on {single_date}")
-        return pd.DataFrame(), txn_counter
-    
-    if single_date.weekday() in [5, 6]:
-        drink_probability = 0.18
-        time_range = (16, 23)
-    elif single_date.weekday() == 4:
-        drink_probability = 0.15
-        time_range = (17, 22)
-    else:
-        drink_probability = 0.08
-        time_range = (18, 21)
-    
-    n_drinkers = int(len(drinking_customers) * drink_probability)
-    if n_drinkers == 0:
-        return pd.DataFrame(), txn_counter
-    
-    selected_customers = drinking_customers.sample(n=n_drinkers)
-    
-    transactions = []
-    successful_transactions = 0
-    
-    for _, customer in selected_customers.iterrows():
-        distress_level = customer.get('distress_level', 0.0)
-        if distress_level > 0.5 and random.random() < 0.5:
-            continue  # Skip some discretionary spending for distressed
-        
-        merchant_info = get_merchant_info('alcohol', 1)[0]
-        
-        amount = calculate_transaction_amount(
-            merchant_info, customer.get('age', 30), 
-            max(0, customer.get('income', 25000)), 'alcohol', distress_level
-        )
-        
-        if not balance_tracker.can_transact(customer['account_id'], amount):
-            current_balance = balance_tracker.get_balance(customer['account_id'])
-            overdraft_limit = balance_tracker.account_balances[customer['account_id']]['overdraft_limit']
-            max_amount = current_balance - overdraft_limit - 10
-            
-            if max_amount < 50:
-                continue
-            amount = min(amount, max_amount)
-        
-        if balance_tracker.process_transaction(customer['account_id'], amount, 'debit'):
-            hour = np.random.randint(time_range[0], time_range[1] + 1)
-            minute = np.random.randint(0, 60)
-            time_str = f"{hour:02d}:{minute:02d}:00"
-            
-            transactions.append({
-                "transaction_id": f"TXN{year}{txn_counter + successful_transactions:06d}",
-                "account_id": customer['account_id'],
-                "transaction_date": single_date.strftime("%Y-%m-%d"),
-                "transaction_time": time_str,
-                "amount": amount,
-                "debit_credit": "debit",
-                "category": "alcohol",
-                "status": get_transaction_status_weighted(merchant_info['size'], single_date, distress_level),
-                "description": f"Purchase at {merchant_info['name']}",
-                "immediate_payment": False,
-                "receiving_account": "",
-                "receiving_bank": "",
-                "transaction_cost": 0.0,
-                "ewallet_number": None,
-                "channel": "pos",
-                "merchant_name": merchant_info['name']
-            })
-            successful_transactions += 1
-    
-    if transactions:
-        logger.debug(f"Generated {len(transactions)} alcohol transactions for {single_date}")
-        return pd.DataFrame(transactions), txn_counter + successful_transactions
-    return pd.DataFrame(), txn_counter
+    if corps.empty:
+        return pd.DataFrame(), tx_id
+    tx_list = []
+    emp_offset = 0
+    for _, corp in corps.iterrows():
+        emp_count = random.randint(10, 250)
+        corp_acc = corp['account_id']
+        if corp_acc not in manager.balances:
+            atype, odate, status, scdate, _ = get_account_info(accs, corp_acc)
+            manager.setup_account(corp_acc, atype, 10000, odate, status, scdate)
+        available_channels = get_available_channels(corp_acc, accs)
+        for emp in range(emp_count):
+            sal_amt = round(random.uniform(3500, 45000), 2)
+            tme = f"{random.randint(6, 10):02d}:{random.randint(0, 59):02d}:00"
+            dt = pd.to_datetime(date.strftime('%Y-%m-%d') + ' ' + tme)
+            status = 'failed'
+            if manager.is_debit_allowed(corp_acc, sal_amt, dt.date()):
+                status = 'completed'
+                manager.execute_tx(corp_acc, sal_amt, True, dt)
+            channel = random.choice(available_channels)
+            tx_cost = round(random.uniform(10, 50), 2) if channel in ['branch', 'atm'] else 0.0
+            tx = {
+                'transaction_id': f"TXN{year}{tx_id + emp_offset + emp:06d}",
+                'account_id': corp_acc,
+                'transaction_date': date.strftime('%Y-%m-%d'),
+                'transaction_time': tme,
+                'amount': sal_amt,
+                'debit_credit': 'debit',
+                'category': 'salary payment',
+                'status': status,
+                'description': f"Employee salary payment #{emp + 1}",
+                'immediate_payment': True,
+                'receiving_account': f"EMP{random.randint(100000, 999999)}",
+                'receiving_bank': 'Same Bank',
+                'transaction_cost': tx_cost,
+                'channel': channel,
+                'merchant_name': ''
+            }
+            tx_list.append(add_errors(tx))
+        emp_offset += emp_count
+    if tx_list:
+        df = pd.DataFrame(tx_list)
+        return df, tx_id + len(tx_list)
+    return pd.DataFrame(), tx_id
 
-def create_initial_deposits(eligible_accounts, customers_df, balance_tracker, date, txn_counter, year):
-    """Create initial deposit transactions and update balance tracker"""
-    n_accounts = len(eligible_accounts)
-    deposit_amounts = np.maximum(100, np.random.uniform(200, 8000, n_accounts)).round(2)
-    
-    transactions = []
-    
-    for i, (_, account) in enumerate(eligible_accounts.iterrows()):
-        amount = deposit_amounts[i]
-        
-        balance_tracker.initialize_account_balance(
-            account['account_id'], 
-            account.get('account_type', 'Standard Banking'),
-            amount
-        )
-        
-        transactions.append({
-            "transaction_id": f"TXN{year}{txn_counter + i:06d}",
-            "account_id": account['account_id'],
-            "transaction_date": date,
-            "transaction_time": fake.time(),
-            "amount": amount,
-            "debit_credit": "credit",
-            "category": "initial deposit",
-            "status": "completed",
-            "description": "Account opening deposit",
-            "immediate_payment": False,
-            "receiving_account": account['account_id'],
-            "receiving_bank": "",
-            "transaction_cost": 0.0,
-            "ewallet_number": None,
-            "channel": np.random.choice(["branch", "online banking"]),
-            "merchant_name": ""
-        })
-    
-    logger.info(f"Created {len(transactions)} initial deposits for {year}")
-    return pd.DataFrame(transactions), txn_counter + n_accounts
+def process_monthly_txs(year, month, accs, custs, manager, start_id, loans, debits, fraudster):
+    """Generate all transactions for a given month."""
+    all_txs = []
+    month_start = datetime(year, month, 1)
+    month_end = month_start + pd.offsets.MonthEnd(0)
+    dates = pd.date_range(month_start, month_end)
 
-def generate_category_transactions(category, eligible_accounts, customers_df, balance_tracker,
-                                 single_date, base_count, txn_counter, year):
-    """Generate transactions for a specific category with balance checking"""
-    weekend_mult = WEEKEND_MULTIPLIERS.get(category, 1.0) if single_date.weekday() >= 5 else 1.0
-    payday_mult = PAYDAY_MULTIPLIERS.get(category, 1.0) if 25 <= single_date.day <= 28 else 1.0
-    cash_flow_mult = 0.6 if 1 <= single_date.day <= 7 and category not in ['utilities', 'medical'] else 1.0
-    
-    final_count = int(base_count * weekend_mult * payday_mult * cash_flow_mult)
-    
-    if final_count == 0:
-        return pd.DataFrame(), txn_counter
-    
-    acc_cust = eligible_accounts.merge(customers_df, on="customer_id", how="left")
-    
-    transactions = []
-    successful_transactions = 0
-    
-    for _ in range(final_count):
-        customer = acc_cust.sample(n=1).iloc[0]
-        distress_level = customer.get('distress_level', 0.0)
-        
-        if distress_level > 0.5 and category in ['alcohol', 'entertainment', 'clothing', 'restaurants'] and random.random() < 0.5:
-            continue  # Skip some discretionary for distressed
-        
-        merchant_info = get_merchant_info(category, 1)[0]
-        
-        hour = int(generate_realistic_time(category, single_date).split(':')[0])
-        if not is_merchant_open(merchant_info, hour):
+    for day in tqdm(dates, desc=f"Generating {year}-{month:02d}"):
+        if day.month == 1 and day.day == 1:  # Skip January 1 (public holiday)
             continue
-        
-        amount = calculate_transaction_amount(
-            merchant_info, customer.get('age', 30),
-            max(0, customer.get('income', 25000)), category, distress_level
+        daily_txs = []
+        day_str = day.strftime('%Y-%m-%d')
+        day_dt = pd.to_datetime(day_str)
+
+        active_mask = (
+            (accs['opening_date'] <= day_dt) &
+            (
+                (accs['status'] != 'closed') |
+                (accs['status_change_date'] > day_dt) |
+                accs['status_change_date'].isna()
+            ) &
+            (
+                (accs['status'] == 'active') |
+                ((accs['status'].isin(['dormant', 'frozen'])) & (accs['status_change_date'] > day_dt) & ~accs['status_change_date'].isna())
+            )
         )
-        
-        if not balance_tracker.can_transact(customer['account_id'], amount):
-            current_balance = balance_tracker.get_balance(customer['account_id'])
-            overdraft_limit = balance_tracker.account_balances[customer['account_id']]['overdraft_limit']
-            max_amount = current_balance - overdraft_limit - 20
-            
-            if max_amount < 10:
+        active_day = accs[active_mask].copy()
+        if active_day.empty:
+            continue
+
+        due_accs = [aid for aid, info in manager.pending_deposits.items()
+                    if info['due_date'].strftime('%Y-%m-%d') == day_str and manager.get_status_at_date(aid, day_dt) != 'closed']
+        pend_txs = []
+        for aid in due_accs:
+            info = manager.pending_deposits.pop(aid)
+            amt = info['amount']
+            hr = random.randint(9, 15)
+            mn = random.randint(0, 59)
+            tme = f"{hr:02d}:{mn:02d}:00"
+            dt = pd.to_datetime(day_str + ' ' + tme)
+            channel = 'branch'
+            tx_cost = round(random.uniform(10, 50), 2)
+            if manager.execute_tx(aid, amt, False, dt):
+                tx = {
+                    'transaction_id': f"TXN{year}{start_id:06d}",
+                    'account_id': aid,
+                    'transaction_date': day_str,
+                    'transaction_time': tme,
+                    'amount': amt,
+                    'debit_credit': 'credit',
+                    'category': 'initial deposit',
+                    'status': 'completed',
+                    'description': 'Account opening deposit',
+                    'immediate_payment': False,
+                    'receiving_account': aid,
+                    'receiving_bank': 'Same Bank',
+                    'transaction_cost': tx_cost,
+                    'channel': channel,
+                    'merchant_name': ''
+                }
+                pend_txs.append(add_errors(tx))
+                start_id += 1
+        if pend_txs:
+            daily_txs.append(pd.DataFrame(pend_txs))
+
+        day_loans = loans[loans['transaction_date'] == day_str].copy()
+        day_loans = day_loans[day_loans['account_id'].isin(active_day['account_id'])]
+        if not day_loans.empty:
+            if 'transaction_id' not in day_loans:
+                day_loans['transaction_id'] = [f"TXN{year}{start_id + i:06d}" for i in range(len(day_loans))]
+                start_id += len(day_loans)
+            for col in ['description', 'immediate_payment', 'receiving_account', 'receiving_bank', 'transaction_cost',
+                        'channel', 'merchant_name', 'status', 'debit_credit', 'category']:
+                if col not in day_loans:
+                    if col == 'status':
+                        day_loans[col] = 'completed'
+                    elif col == 'category':
+                        day_loans[col] = 'loan payment'
+                    elif col == 'immediate_payment':
+                        day_loans[col] = False
+                    elif col == 'transaction_cost':
+                        day_loans[col] = round(random.uniform(10, 50), 2)
+                    elif col == 'channel':
+                        day_loans[col] = 'branch'
+                    elif col == 'debit_credit':
+                        day_loans[col] = 'debit'
+                    else:
+                        day_loans[col] = ''
+            if 'transaction_time' not in day_loans:
+                day_loans['transaction_time'] = '09:00:00'
+            processed_loans = []
+            for _, loan in day_loans.iterrows():
+                aid = loan['account_id']
+                if aid not in manager.balances:
+                    atype, odate, status, scdate, _ = get_account_info(accs, aid)
+                    manager.setup_account(aid, atype, 0, odate, status, scdate)
+                dir_debit = loan.get('debit_credit', 'debit') == 'debit'
+                amt = loan['amount']
+                dt_loan = pd.to_datetime(loan['transaction_date'] + ' ' + loan['transaction_time'])
+                status = loan['status']
+                if dir_debit:
+                    if not manager.is_debit_allowed(aid, amt, dt_loan.date()):
+                        status = 'failed'
+                    else:
+                        manager.execute_tx(aid, amt, True, dt_loan)
+                else:
+                    if not manager.is_transaction_allowed(aid, False, dt_loan.date()):
+                        status = 'failed'
+                    else:
+                        manager.execute_tx(aid, amt, False, dt_loan)
+                loan = loan.copy()
+                loan['status'] = status
+                processed_loans.append(loan)
+            day_loans = pd.DataFrame(processed_loans)
+            daily_txs.append(day_loans)
+
+        day_debits = debits[debits['transaction_date'] == day_str].copy()
+        day_debits = day_debits[day_debits['account_id'].isin(active_day['account_id'])]
+        if not day_debits.empty:
+            if 'transaction_id' not in day_debits:
+                day_debits['transaction_id'] = [f"TXN{year}{start_id + i:06d}" for i in range(len(day_debits))]
+                start_id += len(day_debits)
+            for col in ['description', 'immediate_payment', 'receiving_account', 'receiving_bank', 'transaction_cost',
+                        'channel', 'merchant_name', 'status', 'category', 'debit_credit']:
+                if col not in day_debits:
+                    if col == 'status':
+                        day_debits[col] = 'completed'
+                    elif col == 'category':
+                        day_debits[col] = 'debit order'
+                    elif col == 'immediate_payment':
+                        day_debits[col] = False
+                    elif col == 'transaction_cost':
+                        day_debits[col] = round(random.uniform(10, 50), 2)
+                    elif col == 'channel':
+                        day_debits[col] = 'branch'
+                    elif col == 'debit_credit':
+                        day_debits[col] = 'debit'
+                    else:
+                        day_debits[col] = ''
+            if 'transaction_time' not in day_debits:
+                day_debits['transaction_time'] = '06:00:00'
+            processed_debits = []
+            for _, debit in day_debits.iterrows():
+                aid = debit['account_id']
+                if aid not in manager.balances:
+                    atype, odate, status, scdate, _ = get_account_info(accs, aid)
+                    manager.setup_account(aid, atype, 0, odate, status, scdate)
+                dir_debit = debit.get('debit_credit', 'debit') == 'debit'
+                amt = debit['amount']
+                dt_debit = pd.to_datetime(debit['transaction_date'] + ' ' + debit['transaction_time'])
+                status = debit['status']
+                if dir_debit:
+                    if not manager.is_debit_allowed(aid, amt, dt_debit.date()):
+                        status = 'failed'
+                    else:
+                        manager.execute_tx(aid, amt, True, dt_debit)
+                else:
+                    if not manager.is_transaction_allowed(aid, False, dt_debit.date()):
+                        status = 'failed'
+                    else:
+                        manager.execute_tx(aid, amt, False, dt_debit)
+                debit = debit.copy()
+                debit['status'] = status
+                processed_debits.append(debit)
+            day_debits = pd.DataFrame(processed_debits)
+            daily_txs.append(day_debits)
+
+        sal_txs, start_id = generate_salaries(active_day, custs, manager, day, start_id, year, accs)
+        if not sal_txs.empty:
+            daily_txs.append(sal_txs)
+
+        if day.day == 1:
+            merged = active_day.merge(custs, on='customer_id', how='left')
+            unemp = merged[merged['occupation'] == 'Unemployed']
+            if not unemp.empty:
+                grant_txs = []
+                for i, (_, unem) in enumerate(unemp.iterrows()):
+                    aid = unem['account_id']
+                    if aid not in manager.balances:
+                        atype, odate, status, scdate, _ = get_account_info(accs, aid)
+                        manager.setup_account(aid, atype, 0, odate, status, scdate)
+                    dt_grant = pd.to_datetime(day_str + ' 08:00:00')
+                    available_channels = get_available_channels(aid, accs)
+                    channel = random.choice(available_channels)
+                    tx_cost = round(random.uniform(10, 50), 2) if channel in ['branch', 'atm'] else 0.0
+                    if manager.execute_tx(aid, 350, False, dt_grant):
+                        grant_tx = {
+                            'transaction_id': f"TXN{year}{start_id + i:06d}",
+                            'account_id': aid,
+                            'transaction_date': day_str,
+                            'transaction_time': '08:00:00',
+                            'amount': 350.00,
+                            'debit_credit': 'credit',
+                            'category': 'government grant',
+                            'status': 'completed',
+                            'description': 'Monthly social grant',
+                            'immediate_payment': False,
+                            'receiving_account': aid,
+                            'receiving_bank': 'Same Bank',
+                            'transaction_cost': tx_cost,
+                            'channel': channel,
+                            'merchant_name': ''
+                        }
+                        grant_txs.append(add_errors(grant_tx))
+                if grant_txs:
+                    daily_txs.append(pd.DataFrame(grant_txs))
+                    start_id += len(grant_txs)
+
+        pay_txs, start_id = generate_corp_payrolls(active_day, custs, manager, day, start_id, year, accs)
+        if not pay_txs.empty:
+            daily_txs.append(pay_txs)
+
+        for pair in fraudster.cycle_pairs:
+            if random.random() < 0.02 and all(acc in active_day['account_id'].values for acc in pair):
+                cyc_txs, cnt = create_cycle_txs(pair, day, manager, start_id, year, accs)
+                if cyc_txs:
+                    daily_txs.append(pd.DataFrame(cyc_txs))
+                    start_id += cnt
+                    LOGGER.debug(f"Injected cycle for {pair} on {day}")
+
+        if not (day.month == 1 and day.day == 1):
+            cats_counts = [
+                ('groceries', random.randint(80, 150)),
+                ('clothing', random.randint(8, 20)),
+                ('fuel', random.randint(15, 25)),
+                ('restaurants', random.randint(10, 25)),
+                ('retail', random.randint(5, 15)),
+                ('transport', random.randint(20, 40)),
+                ('entertainment', random.randint(3, 10)),
+                ('medical', random.randint(2, 8)),
+                ('utilities', random.randint(5, 12)),
+                ('airtime', random.randint(15, 30)),
+                ('electronics', random.randint(3, 8))
+            ]
+            for cat, cnt in cats_counts:
+                cat_txs, start_id = produce_category_txs(cat, active_day, custs, manager, day, cnt, start_id, year, fraudster, accs)
+                if not cat_txs.empty:
+                    daily_txs.append(cat_txs)
+
+        if daily_txs:
+            all_txs.extend(daily_txs)
+
+    if all_txs:
+        combined = pd.concat(all_txs, ignore_index=True)
+        if not combined.empty:
+            combined['dt'] = pd.to_datetime(combined['transaction_date'] + ' ' + combined['transaction_time'])
+            combined = combined.sort_values(['dt', 'debit_credit'], ascending=[True, True])
+            combined.drop('dt', axis=1, inplace=True)
+        LOGGER.info(f"Month {month:02d} complete: {len(combined)} txs")
+        return combined, start_id
+    return pd.DataFrame(), start_id
+
+def generate_initial_deposits(year, accs, custs, manager):
+    """Generate initial deposit transactions for all accounts based on opening_date + 0-7 days."""
+    year_start = datetime(year, 1, 1).date()
+    pending = {}
+    for _, acc in accs.iterrows():
+        aid = acc['account_id']
+        atype = acc.get('account_type', 'Standard Banking')
+        odate = acc.get('opening_date')
+        status = acc.get('status', 'active')
+        scdate = acc.get('status_change_date')
+        if pd.isna(odate):
+            odate = pd.to_datetime(f"{year}-01-01")
+        odate = odate.date()
+        if pd.isna(scdate):
+            scdate = None
+        else:
+            scdate = scdate.date()
+        if scdate and odate < year_start and scdate <= year_start and status == 'closed':
+            initial_balance = 0
+        elif odate < year_start:
+            if status == 'closed' and scdate and scdate <= year_start:
+                initial_balance = 0
+            else:
+                initial_balance = round(np.random.lognormal(9, 1.5), 2)
+        else:
+            initial_balance = 0
+        manager.setup_account(aid, atype, initial_balance, odate, status, scdate)
+        if initial_balance > 0:
+            manager.first_credits[aid] = odate
+        if odate >= year_start and status != 'closed' and (scdate is None or odate < scdate):
+            delay = random.randint(0, 7)
+            due_dt = pd.to_datetime(odate + timedelta(days=delay))
+            if due_dt.date() < year_start:
+                due_dt = datetime.combine(year_start, datetime.min.time())
+            amt = round(np.random.uniform(500, 10000), 2)
+            pending[aid] = {'due_date': due_dt.date(), 'amount': amt}
+
+    manager.pending_deposits = pending
+
+    due_dates = sorted(set(info['due_date'] for info in pending.values() if info['due_date'] >= year_start))
+    initial_txs = []
+    tx_id = 1
+
+    for due in due_dates:
+        if due.month == 1 and due.day == 1:  # Skip January 1
+            continue
+        day_str = due.strftime('%Y-%m-%d')
+        due_accs = [aid for aid, info in manager.pending_deposits.items() if info['due_date'].strftime('%Y-%m-%d') == day_str]
+        for aid in due_accs:
+            if manager.get_status_at_date(aid, due) == 'closed':
+                manager.pending_deposits.pop(aid)
                 continue
-            amount = min(amount, max_amount)
-        
-        if balance_tracker.process_transaction(customer['account_id'], amount, 'debit'):
-            transactions.append({
-                "transaction_id": f"TXN{year}{txn_counter + successful_transactions:06d}",
-                "account_id": customer['account_id'],
-                "transaction_date": single_date.strftime("%Y-%m-%d"),
-                "transaction_time": generate_realistic_time(category, single_date),
-                "amount": amount,
-                "debit_credit": "debit",
-                "category": category,
-                "status": get_transaction_status_weighted(merchant_info['size'], single_date, distress_level),
-                "description": f"Purchase at {merchant_info['name']}",
-                "immediate_payment": False,
-                "receiving_account": "",
-                "receiving_bank": "",
-                "transaction_cost": 0.0,
-                "ewallet_number": None,
-                "channel": "pos" if category in ['groceries', 'clothing', 'fuel'] else np.random.choice(["pos", "online banking"]),
-                "merchant_name": merchant_info['name']
-            })
-            successful_transactions += 1
-    
-    if transactions:
-        logger.debug(f"Generated {len(transactions)} {category} transactions for {single_date}")
-        return pd.DataFrame(transactions), txn_counter + successful_transactions
-    return pd.DataFrame(), txn_counter
+            info = manager.pending_deposits.pop(aid)
+            amt = info['amount']
+            hr = random.randint(9, 15)
+            mn = random.randint(0, 59)
+            tme = f"{hr:02d}:{mn:02d}:00"
+            dt = pd.to_datetime(day_str + ' ' + tme)
+            channel = 'branch'
+            tx_cost = round(random.uniform(10, 50), 2)
+            if manager.execute_tx(aid, amt, False, dt):
+                tx = {
+                    'transaction_id': f"TXN{year}{tx_id:06d}",
+                    'account_id': aid,
+                    'transaction_date': day_str,
+                    'transaction_time': tme,
+                    'amount': amt,
+                    'debit_credit': 'credit',
+                    'category': 'cash deposit',
+                    'status': 'completed',
+                    'description': 'Initial cash deposit',
+                    'immediate_payment': False,
+                    'receiving_account': aid,
+                    'receiving_bank': 'Same Bank',
+                    'transaction_cost': tx_cost,
+                    'channel': channel,
+                    'merchant_name': ''
+                }
+                initial_txs.append(add_errors(tx))
+                tx_id += 1
 
-def generate_salary_payments(eligible_accounts, customers_df, balance_tracker,
-                           single_date, txn_counter, year):
-    """Generate salary payments with balance updates"""
-    if not (23 <= single_date.day <= 28):
-        return pd.DataFrame(), txn_counter
-    
-    acc_cust = eligible_accounts.merge(customers_df, on="customer_id", how="left")
-    working_customers = acc_cust[acc_cust["occupation"] != "Unemployed"]
-    
-    if working_customers.empty:
-        logger.debug(f"No working customers for salary payments on {single_date}")
-        return pd.DataFrame(), txn_counter
-    
-    n_salary = int(len(working_customers) * 0.8)
-    selected_customers = working_customers.sample(n=n_salary)
-    
-    transactions = []
-    
-    for i, (_, customer) in enumerate(selected_customers.iterrows()):
-        base_salary = customer.get('income', np.random.normal(25000, 8000))
-        base_salary = max(4000, abs(base_salary))
-        monthly_salary = max(4000, np.random.normal(base_salary, base_salary * 0.2))
-        
-        balance_tracker.process_transaction(customer['account_id'], monthly_salary, 'credit')
-        
-        transactions.append({
-            "transaction_id": f"TXN{year}{txn_counter + i:06d}",
-            "account_id": customer['account_id'],
-            "transaction_date": single_date.strftime("%Y-%m-%d"),
-            "transaction_time": f"{np.random.randint(6, 10):02d}:00:00",
-            "amount": round(monthly_salary, 2),
-            "debit_credit": "credit",
-            "category": "salary payment",
-            "status": "completed",
-            "description": "Monthly salary",
-            "immediate_payment": False,
-            "receiving_account": customer['account_id'],
-            "receiving_bank": "",
-            "transaction_cost": 0.0,
-            "ewallet_number": None,
-            "channel": np.random.choice(["online banking", "mobile banking app"]),
-            "merchant_name": ""
-        })
-    
-    logger.debug(f"Generated {len(transactions)} salary payments for {single_date}")
-    return pd.DataFrame(transactions), txn_counter + len(transactions)
+    if initial_txs:
+        df = pd.DataFrame(initial_txs)
+        if not df.empty:
+            df['dt'] = pd.to_datetime(df['transaction_date'] + ' ' + df['transaction_time'])
+            df = df.sort_values('dt')
+            df.drop('dt', axis=1, inplace=True)
+        fname = f"banking_data/transactions_by_year/transactions_{year}_00.parquet"
+        df.to_parquet(fname, index=False, engine='fastparquet')
+        LOGGER.info(f"Saved {len(df)} initial deposits to {fname}")
+        return tx_id
+    return 1
 
-def generate_transactions_for_month(year, month, eligible_accounts, customers_df, 
-                                   balance_tracker, txn_counter, loan_transactions_df, debit_order_transactions_df):
-    """Generate transactions for a specific month with balance tracking"""
-    transactions = []
-    
-    start_date = datetime(year, month, 1)
-    end_date = (start_date + pd.offsets.MonthEnd(0)).date()
-    date_range = pd.date_range(start_date, end_date)
-    
-    for single_date in tqdm(date_range, desc=f"Processing {year}-{month:02d}"):
-        day_transactions = []
-        
-        date_str = single_date.strftime("%Y-%m-%d")
-        
-        # Include loan and debit order transactions for the day
-        daily_loans = loan_transactions_df[loan_transactions_df['transaction_date'] == date_str]
-        if not daily_loans.empty:
-            day_transactions.append(daily_loans)
-            for _, loan in daily_loans.iterrows():
-                balance_tracker.process_transaction(loan['account_id'], loan['amount'], loan['debit_credit'])
-        
-        daily_debit_orders = debit_order_transactions_df[debit_order_transactions_df['transaction_date'] == date_str]
-        if not daily_debit_orders.empty:
-            day_transactions.append(daily_debit_orders)
-            for _, debit_order in daily_debit_orders.iterrows():
-                balance_tracker.process_transaction(debit_order['account_id'], debit_order['amount'], debit_order['debit_credit'])
-        
-        salary_txns, txn_counter = generate_salary_payments(
-            eligible_accounts, customers_df, balance_tracker, single_date, txn_counter, year
-        )
-        if not salary_txns.empty:
-            day_transactions.append(salary_txns)
-        
-        if 1 <= single_date.day <= 5:
-            acc_cust = eligible_accounts.merge(customers_df, on="customer_id", how="left")
-            unemployed_customers = acc_cust[acc_cust["occupation"] == "Unemployed"]
-            
-            if not unemployed_customers.empty:
-                for _, customer in unemployed_customers.iterrows():
-                    balance_tracker.process_transaction(customer['account_id'], 350, 'credit')
-                
-                grants_df = pd.DataFrame({
-                    "transaction_id": [f"TXN{year}{i:06d}" for i in range(txn_counter, txn_counter + len(unemployed_customers))],
-                    "account_id": unemployed_customers['account_id'].values,
-                    "transaction_date": date_str,
-                    "transaction_time": "08:00:00",
-                    "amount": 350.00,
-                    "debit_credit": "credit",
-                    "category": "government grant",
-                    "status": "completed",
-                    "description": "Monthly social grant",
-                    "immediate_payment": False,
-                    "receiving_account": unemployed_customers['account_id'].values,
-                    "receiving_bank": "",
-                    "transaction_cost": 0.0,
-                    "ewallet_number": None,
-                    "channel": "branch",
-                    "merchant_name": ""
-                })
-                day_transactions.append(grants_df)
-                txn_counter += len(unemployed_customers)
-        
-        alcohol_txns, txn_counter = generate_alcohol_transactions(
-            eligible_accounts, customers_df, balance_tracker, single_date, txn_counter, year
-        )
-        if not alcohol_txns.empty:
-            day_transactions.append(alcohol_txns)
-        
-        categories_and_counts = [
-            ('groceries', random.randint(80, 150)),
-            ('clothing', random.randint(8, 20)),
-            ('fuel', random.randint(15, 25)),
-            ('restaurants', random.randint(10, 25)),
-            ('retail', random.randint(5, 15)),
-            ('transport', random.randint(20, 40)),
-            ('entertainment', random.randint(3, 10)),
-            ('medical', random.randint(2, 8)),
-            ('utilities', random.randint(5, 12)),
-            ('airtime', random.randint(15, 30))
-        ]
-        
-        for category, base_count in categories_and_counts:
-            cat_txns, txn_counter = generate_category_transactions(
-                category, eligible_accounts, customers_df, balance_tracker,
-                single_date, base_count, txn_counter, year
-            )
-            if not cat_txns.empty:
-                day_transactions.append(cat_txns)
-        
-        if day_transactions:
-            transactions.extend(day_transactions)
-    
-    if transactions:
-        combined = pd.concat(transactions, ignore_index=True)
-        logger.info(f"Generated {len(combined)} transactions for {year}-{month:02d}")
-        return combined, txn_counter
-    logger.debug(f"No transactions generated for {year}-{month:02d}")
-    return pd.DataFrame(), txn_counter
-
-def merge_monthly_transactions(month_transactions, loan_transactions_df, debit_order_transactions_df, year, month):
-    """Merge base, loan, and debit order transactions for a specific month"""
-    def standardize_columns(df):
-        df = df.copy()
-        df.columns = df.columns.str.lower()
-        return df
-    
-    month_transactions = standardize_columns(month_transactions)
-    monthly_loan_transactions = loan_transactions_df[
-        loan_transactions_df['transaction_date'].str.startswith(f"{year}-{month:02d}")
-    ]
-    monthly_debit_order_transactions = debit_order_transactions_df[
-        debit_order_transactions_df['transaction_date'].str.startswith(f"{year}-{month:02d}")
-    ]
-    
-    monthly_loan_transactions = standardize_columns(monthly_loan_transactions)
-    monthly_debit_order_transactions = standardize_columns(monthly_debit_order_transactions)
-    
-    all_columns = set(month_transactions.columns) | set(monthly_loan_transactions.columns) | set(monthly_debit_order_transactions.columns)
-    
-    for col in all_columns:
-        if col not in month_transactions.columns:
-            month_transactions[col] = None
-        if col not in monthly_loan_transactions.columns:
-            monthly_loan_transactions[col] = None if col in ['loan_id', 'debit_order_id', 'customer_id'] else ""
-        if col not in monthly_debit_order_transactions.columns:
-            monthly_debit_order_transactions[col] = None if col in ['loan_id', 'debit_order_id', 'customer_id'] else ""
-    
-    columns_order = sorted(all_columns)
-    combined = pd.concat([
-        month_transactions[columns_order],
-        monthly_loan_transactions[columns_order],
-        monthly_debit_order_transactions[columns_order]
-    ], ignore_index=True)
-    
-    logger.info(f"Merged {len(combined)} transactions for {year}-{month:02d}")
-    return combined
-
-def generate_transactions_for_year(year):
-    """Generate transactions for a specific year with enhanced balance tracking"""
-    logger.info(f"Generating enhanced transactions for {year}...")
-    
-    accounts_df, customers_df = load_banking_data_for_year(year)
-    eligible_accounts = accounts_df.copy()
-    logger.info(f"Loaded {len(accounts_df)} accounts and {len(customers_df)} customers for {year}")
-    
-    if eligible_accounts.empty:
-        logger.error(f"No accounts available for {year}. Skipping transaction generation.")
+def orchestrate_year(year):
+    """Main orchestration for generating a year's transactions."""
+    LOGGER.info(f"Starting transaction synthesis for {year}")
+    accs, custs = fetch_data_up_to_year(year)
+    if accs.empty:
+        LOGGER.error("No accounts found")
         return
-    
-    loan_transactions_df, debit_order_transactions_df = load_existing_transactions(year, accounts_df)
-    
-    balance_tracker = BalanceTracker()
-    
-    temp_dir = f"banking_data/transactions_by_year/temp_{year}"
-    try:
-        os.makedirs(temp_dir, exist_ok=True)
-    except OSError as e:
-        logger.error(f"Failed to create temp directory {temp_dir}: {e}")
-        return
-    
-    txn_counter = 1
-    monthly_files = []
-    
-    new_accounts = eligible_accounts[eligible_accounts["account_id"].str.contains(str(year))]
-    if not new_accounts.empty:
-        initial_deposits, txn_counter = create_initial_deposits(
-            new_accounts, customers_df, balance_tracker, f"{year}-01-01", txn_counter, year
-        )
-        initial_file = f"{temp_dir}/initial_deposits.parquet"
-        initial_deposits.to_parquet(initial_file, index=False, engine="fastparquet")
-        monthly_files.append(initial_file)
-    
-    existing_accounts = eligible_accounts[~eligible_accounts["account_id"].str.contains(str(year))]
-    for _, account in existing_accounts.iterrows():
-        estimated_balance = np.random.uniform(500, 15000)
-        balance_tracker.initialize_account_balance(
-            account['account_id'],
-            account.get('account_type', 'Standard Banking'),
-            estimated_balance
-        )
-    
-    preprocess_scheduled_transactions(balance_tracker, loan_transactions_df, debit_order_transactions_df)
-    
-    for month in range(1, 13):
-        month_transactions, txn_counter = generate_transactions_for_month(
-            year, month, eligible_accounts, customers_df, balance_tracker, 
-            txn_counter, loan_transactions_df, debit_order_transactions_df
-        )
-        
-        if not month_transactions.empty:
-            # Merge with loan and debit order transactions for the month
-            combined_month = merge_monthly_transactions(
-                month_transactions, loan_transactions_df, debit_order_transactions_df, year, month
-            )
-            month_file = f"banking_data/transactions_by_year/transactions_{year}_{month:02d}.parquet"
-            combined_month.to_parquet(month_file, index=False, engine="fastparquet")
-            monthly_files.append(month_file)
-            logger.info(f"Saved {len(combined_month)} transactions to {month_file}")
-    
-    # Clean up temporary files
-    for f in monthly_files:
-        if os.path.exists(f) and "temp_" in f:
-            try:
-                os.remove(f)
-            except OSError as e:
-                logger.warning(f"Failed to remove temp file {f}: {e}")
-    try:
-        os.rmdir(temp_dir)
-    except OSError as e:
-        logger.warning(f"Failed to remove temp directory {temp_dir}: {e}")
-    
-    logger.info(f"Generated transactions for {year}, saved as monthly files in banking_data/transactions_by_year/")
 
-def main():
-    """Main function to generate enhanced transaction data"""
+    fraudster = FraudInjector(year)
+    fraudster.pick_suspects(accs, custs)
+
+    loans, debits = load_scheduled_txs(year, accs)
+    manager = AccountBalanceManager()
+
+    os.makedirs("banking_data/transactions_by_year", exist_ok=True)
+
+    schema_cols = [
+        'transaction_id', 'account_id', 'transaction_date', 'transaction_time', 'amount',
+        'debit_credit', 'category', 'status', 'description', 'immediate_payment',
+        'receiving_account', 'receiving_bank', 'transaction_cost', 'channel', 'merchant_name'
+    ]
+    pd.DataFrame(columns=schema_cols).to_parquet(f"banking_data/transactions_by_year/transactions_{year}_00.parquet",
+                                                 index=False, engine='fastparquet')
+    LOGGER.info("Schema file created")
+
+    tx_counter = generate_initial_deposits(year, accs, custs, manager)
+
+    for mon in range(1, 13):
+        mon_txs, tx_counter = process_monthly_txs(year, mon, accs, custs, manager, tx_counter, loans, debits, fraudster)
+        if not mon_txs.empty:
+            if random.random() < 0.001:
+                dup_cnt = random.randint(1, 3)
+                dups = mon_txs.sample(min(dup_cnt, len(mon_txs)))
+                mon_txs = pd.concat([mon_txs, dups], ignore_index=True)
+            fname = f"banking_data/transactions_by_year/transactions_{year}_{mon:02d}.parquet"
+            mon_txs.to_parquet(fname, index=False, engine='fastparquet')
+            LOGGER.info(f"Saved {len(mon_txs)} txs to {fname}")
+
+    LOGGER.info("=" * 60)
+    LOGGER.info(f"Year {year} finalized with fraud injection and status handling")
+    LOGGER.info("Output in banking_data/transactions_by_year/")
+    LOGGER.info("=" * 60)
+
+def run_generator():
+    """Entry point for the generator."""
     try:
-        year = int(input("Enter the year to process: "))
-        if year < 2000:
-            logger.error("Year must be 2000 or later.")
-            return None
-    except ValueError:
-        logger.error("Please enter a valid integer year.")
-        return None
-    
-    try:
-        os.makedirs("banking_data/transactions_by_year", exist_ok=True)
-    except OSError as e:
-        logger.error(f"Failed to create output directory: {e}")
-        return None
-    
-    generate_transactions_for_year(year)
-    
-    logger.info(f"\nTransaction files generated for {year}:")
-    for month in range(1, 13):
-        month_file = f"banking_data/transactions_by_year/transactions_{year}_{month:02d}.parquet"
-        if os.path.exists(month_file):
-            file_size = os.path.getsize(month_file) / (1024 * 1024)  # Size in MB
-            logger.info(f"{month_file}: {file_size:.2f} MB")
-    
-    return None
+        yr = int(input("Enter year: "))
+        if yr < 2000:
+            raise ValueError("Year too early")
+    except ValueError as e:
+        LOGGER.error(f"Invalid year: {e}")
+        return
+    orchestrate_year(yr)
+    LOGGER.info(f"\nYear {yr} files:")
+    for m in range(0, 13):
+        fname = f"banking_data/transactions_by_year/transactions_{yr}_{m:02d}.parquet"
+        if os.path.exists(fname):
+            size_mb = os.path.getsize(fname) / (1024 * 1024)
+            LOGGER.info(f"  {fname}: {size_mb:.2f} MB")
 
 if __name__ == "__main__":
-    main()
+    run_generator()
