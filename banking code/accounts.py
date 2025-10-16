@@ -7,11 +7,12 @@ import os
 from tqdm import tqdm
 import argparse
 from uuid import uuid4
+import json
 
 # Assuming cities_branch_codes is available from previous context
 from cities_branch_codes import cities_branch_codes
 
-# Helper functions defined at module level
+# Helper functions (keeping all existing ones unchanged)
 def calculate_age(birth_date, target_year):
     return target_year - birth_date.year
 
@@ -24,11 +25,11 @@ def get_income_level(customer_data):
     else:
         return 'high'
 
-def generate_sa_account_number(branch_code, counter):
-    """Generate realistic SA account number: branch(6) + type(2) + sequence(4) + check(1)"""
-    branch_num = branch_code  # Use full branch code (e.g., '200101')
-    account_type = random.choice(['01', '02', '03', '27', '28'])  # Savings, Current, etc.
-    sequence = str(counter % 10000).zfill(4)
+def generate_sa_account_number(branch_code, global_counter):
+    """Generate GLOBALLY UNIQUE SA account number: branch(6) + type(2) + sequence(6) + check(1)"""
+    branch_num = branch_code
+    account_type = random.choice(['01', '02', '03', '27', '28'])
+    sequence = str(global_counter % 1000000).zfill(6)
     
     # Simple check digit (Luhn-like)
     base = branch_num + account_type + sequence
@@ -45,14 +46,14 @@ def generate_swift_code(branch_code):
     return base_swift
 
 def generate_iban(account_number):
-    bank_code = '250655'  # Fixed Bank code
+    bank_code = '250655'
     check_digits = str(random.randint(10, 99))
     return f"ZA{check_digits}{bank_code}{account_number[:10].zfill(10)}"
 
 def generate_card_number(account_type, year):
     """Generate unique debit/credit card number"""
     if account_type in ['islamic']:
-        return None  # No interest-bearing cards
+        return None
     
     card_types = {
         'visa_debit': '4',
@@ -64,11 +65,9 @@ def generate_card_number(account_type, year):
     is_credit = account_type in ['premium', 'gold', 'platinum', 'business']
     card_type = random.choice(['visa_credit', 'mastercard_credit'] if is_credit else ['visa_debit', 'mastercard_debit'])
     
-    # Generate unique 16-digit card number
     card_num = card_types[card_type]
     card_num += ''.join([str(random.randint(0, 9)) for _ in range(14)])
     
-    # Luhn check digit
     digits = [int(d) for d in card_num]
     check_sum = 0
     for i, d in enumerate(reversed(digits)):
@@ -105,7 +104,7 @@ def determine_account_purpose(customer_data, account_type):
 
 def generate_beneficiaries(customer_data, fake):
     """Generate account beneficiaries"""
-    if random.random() < 0.4:  # 60% don't set beneficiaries
+    if random.random() < 0.4:
         return None
     
     num_beneficiaries = random.choices([1, 2, 3], weights=[0.6, 0.3, 0.1])[0]
@@ -123,7 +122,7 @@ def should_reject_application(customer_data, account_type, year):
     """Determine if account application should be rejected"""
     risk_score = customer_data.get('risk_score', 0.5)
     
-    rejection_prob = 0.03  # 3% base rejection rate
+    rejection_prob = 0.03
     if risk_score > 0.85:
         rejection_prob += 0.15
     elif risk_score > 0.7:
@@ -148,7 +147,6 @@ def should_reject_application(customer_data, account_type, year):
     
     return False, None
 
-# Dictionary of available bundled products per account type
 bundled_products_available = {
     'savings': ['online_banking', 'debit_card'],
     'current': ['online_banking', 'debit_card', 'overdraft_facility'],
@@ -166,25 +164,77 @@ bundled_products_available = {
 def get_branch_code(customer_data):
     """Select branch code based on residential or workplace address"""
     residential_address = customer_data.get('residential_address', '')
-    # Simulate workplace in Johannesburg for 50% of customers
     if random.random() < 0.5:
         return random.choice(cities_branch_codes['Gauteng']['Johannesburg'])
     
-    # Handle null or non-string residential address
     if not isinstance(residential_address, str) or not residential_address:
         return random.choice(cities_branch_codes['Gauteng']['Johannesburg'])
     
-    # Try to match residential address to city (case-insensitive, flexible matching)
     address_lower = residential_address.lower()
     for province, cities in cities_branch_codes.items():
         for city, codes in cities.items():
             city_lower = city.lower()
-            # Check if city name is in address or address contains keywords like 'Odendaalsrus'
             if city_lower in address_lower or any(keyword in address_lower for keyword in [city_lower, 'odendaalsrus']):
                 return random.choice(codes)
     
-    # Default to Johannesburg if no match
     return random.choice(cities_branch_codes['Gauteng']['Johannesburg'])
+
+class GlobalAccountCounter:
+    """Thread-safe, persistent global account counter"""
+    
+    def __init__(self, github_repo_path):
+        self.github_repo_path = github_repo_path
+        self.counter_file = f'{github_repo_path}/account_counter.json'
+        self.counter = self._load_counter()
+    
+    def _load_counter(self):
+        """Load counter from file, or calculate from existing accounts"""
+        # First, check if counter file exists
+        if os.path.exists(self.counter_file):
+            try:
+                with open(self.counter_file, 'r') as f:
+                    data = json.load(f)
+                    counter = data.get('counter', 0)
+                    print(f"Loaded counter from file: {counter}")
+                    return counter
+            except Exception as e:
+                print(f"Warning: Could not load counter file: {e}")
+        
+        # Otherwise, calculate from existing parquet files
+        total_accounts = 0
+        for year in range(2015, 2026):
+            try:
+                file_path = f'{self.github_repo_path}/accounts_{year}.parquet'
+                if os.path.exists(file_path):
+                    df = pd.read_parquet(file_path)
+                    total_accounts += len(df)
+                    print(f"Loaded {len(df)} existing accounts from {year}")
+            except Exception as e:
+                continue
+        
+        print(f"Total existing accounts across all years: {total_accounts}")
+        self._save_counter(total_accounts)
+        return total_accounts
+    
+    def _save_counter(self, value):
+        """Persist counter to file"""
+        os.makedirs(self.github_repo_path, exist_ok=True)
+        try:
+            with open(self.counter_file, 'w') as f:
+                json.dump({'counter': value, 'timestamp': str(date.today())}, f)
+        except Exception as e:
+            print(f"Warning: Could not save counter file: {e}")
+    
+    def get_next(self):
+        """Get next unique ID and increment"""
+        current = self.counter
+        self.counter += 1
+        self._save_counter(self.counter)
+        return current
+    
+    def peek(self):
+        """View current counter without incrementing"""
+        return self.counter
 
 def generate_accounts(year):
     # Initialize seeds for reproducibility
@@ -221,8 +271,9 @@ def generate_accounts(year):
 
     df_customers = pd.concat([df_customers, previous_customers]).reset_index(drop=True)
 
-    account_types_individual = ['savings', 'current', 'cheque', 'aspire', 'easy', 'islamic', 'joint', 'premium', 'gold', 'platinum']
-    account_types_company = ['business']
+    # *** IMPROVED: Use persistent counter class ***
+    counter = GlobalAccountCounter(github_repo_path)
+    print(f"Starting generation for year {year} with counter at: {counter.peek()}")
 
     account_charges = {
         'savings': {'interest_rate': 0.01, 'monthly_charges': 10, 'transactions_rate': 0.02, 'negative_balance_rate': 0.05},
@@ -410,18 +461,15 @@ def generate_accounts(year):
         if not available_products:
             return None
         
-        # Determine number of products to bundle (max 3)
         num_products = random.choices([0, 1, 2, 3], weights=[0.2, 0.4, 0.3, 0.1])[0]
         if num_products == 0:
             return None
         
-        # Adjust for specific customer conditions
         if customer_data.get('customer_type') == 'Individual':
             age = calculate_age(customer_data.get('birth_date', date(1990, 1, 1)), year)
             if age < 25 and customer_data.get('occupation') == 'Student' and 'student_card' in available_products:
                 return 'student_card'
         
-        # Select random products from available options
         selected_products = random.sample(available_products, min(num_products, len(available_products)))
         return ';'.join(selected_products) if selected_products else None
 
@@ -437,7 +485,6 @@ def generate_accounts(year):
             return opening_date
         return opening_date + timedelta(days=random.randint(1, 7))
 
-    # Set date range for account openings
     if year == 2020:
         opening_start = date(year, 6, 1)
         opening_end = date(year, 12, 31)
@@ -450,8 +497,6 @@ def generate_accounts(year):
 
     accounts = []
     rejected_applications = []
-    # Use a persistent counter for unique account IDs across years
-    account_id_counter = int(str(uuid4().int)[:7])  # Initialize with a unique seed
     customer_account_counts = {}
     customer_primary_accounts = {}
 
@@ -475,19 +520,18 @@ def generate_accounts(year):
         for account_idx in range(num_accounts):
             acc_type = select_realistic_account_type(row, 'Individual')
             
-            # Check for rejection
             is_rejected, rejection_reason = should_reject_application(row, acc_type, year)
             application_date = random_date(max(opening_start, date_of_entry), opening_end)
             if is_rejected:
+                global_id = counter.get_next()
                 rejected_applications.append({
-                    'application_id': f'APP{account_id_counter:07d}',
+                    'application_id': f'APP{global_id:07d}',
                     'customer_id': customer_id,
                     'account_type': acc_type,
                     'application_date': application_date,
                     'rejection_reason': rejection_reason,
                     'rejection_date': application_date
                 })
-                account_id_counter += 1
                 continue
             
             opening_date = application_date
@@ -501,14 +545,15 @@ def generate_accounts(year):
             account_tier = determine_account_tier(acc_type, income_level)
             overdraft_limit, credit_card_limit = generate_credit_limit(acc_type, income_level, annual_income)
             
-            account_number = generate_sa_account_number(branch_code, account_id_counter)
+            global_id = counter.get_next()
+            account_number = generate_sa_account_number(branch_code, global_id)
             swift_code = generate_swift_code(branch_code) if currency != 'ZAR' else None
             iban = generate_iban(account_number) if currency != 'ZAR' else None
             account_purpose = determine_account_purpose(row, acc_type)
             
             is_primary = customer_id not in customer_primary_accounts
             if is_primary:
-                customer_primary_accounts[customer_id] = f'ACC{account_id_counter:07d}'
+                customer_primary_accounts[customer_id] = f'ACC{global_id:07d}'
             
             statement_frequency = random.choice(['monthly', 'quarterly', 'annually'])
             online_banking_enabled = (random.random() < 0.85 if channel_details['opening_channel'] in ['online', 'mobile_app'] else random.random() < 0.65)
@@ -527,7 +572,7 @@ def generate_accounts(year):
             cross_border_enabled = currency != 'ZAR' or random.random() < 0.3
 
             accounts.append({
-                'account_id': f'ACC{account_id_counter:07d}',
+                'account_id': f'ACC{global_id:07d}',
                 'account_number': account_number,
                 'customer_id': customer_id,
                 'account_type': acc_type,
@@ -567,7 +612,6 @@ def generate_accounts(year):
                 **requirements,
                 **channel_details
             })
-            account_id_counter += 1
             customer_account_counts[customer_id] = customer_account_counts.get(customer_id, 0) + 1
 
         # Joint accounts
@@ -586,7 +630,8 @@ def generate_accounts(year):
             account_tier = determine_account_tier('joint', income_level)
             overdraft_limit, credit_card_limit = generate_credit_limit('joint', income_level, annual_income)
             
-            account_number = generate_sa_account_number(branch_code, account_id_counter)
+            global_id = counter.get_next()
+            account_number = generate_sa_account_number(branch_code, global_id)
             account_purpose = 'joint_savings'
             is_primary = False
             statement_frequency = 'monthly'
@@ -605,7 +650,7 @@ def generate_accounts(year):
             beneficiaries = generate_beneficiaries(row, fake)
 
             accounts.append({
-                'account_id': f'ACC{account_id_counter:07d}',
+                'account_id': f'ACC{global_id:07d}',
                 'account_number': account_number,
                 'customer_id': customer_id,
                 'account_type': 'joint',
@@ -645,9 +690,9 @@ def generate_accounts(year):
                 **requirements,
                 **channel_details
             })
-            account_id_counter += 1
             customer_account_counts[customer_id] = customer_account_counts.get(customer_id, 0) + 1
 
+    # Company accounts
     for _, row in tqdm(df_companies.iterrows(), total=len(df_companies), desc="Generating Company Accounts"):
         customer_id = row['customer_id']
         date_of_entry = row['date_of_entry']
@@ -666,15 +711,15 @@ def generate_accounts(year):
             is_rejected, rejection_reason = should_reject_application(row, acc_type, year)
             application_date = random_date(max(opening_start, date_of_entry), opening_end)
             if is_rejected:
+                global_id = counter.get_next()
                 rejected_applications.append({
-                    'application_id': f'APP{account_id_counter:07d}',
+                    'application_id': f'APP{global_id:07d}',
                     'customer_id': customer_id,
                     'account_type': acc_type,
                     'application_date': application_date,
                     'rejection_reason': rejection_reason,
                     'rejection_date': application_date
                 })
-                account_id_counter += 1
                 continue
             
             opening_date = application_date
@@ -688,14 +733,15 @@ def generate_accounts(year):
             account_tier = determine_account_tier(acc_type, income_level)
             overdraft_limit, credit_card_limit = generate_credit_limit(acc_type, income_level, annual_income)
             
-            account_number = generate_sa_account_number(branch_code, account_id_counter)
+            global_id = counter.get_next()
+            account_number = generate_sa_account_number(branch_code, global_id)
             swift_code = generate_swift_code(branch_code) if currency != 'ZAR' else None
             iban = generate_iban(account_number) if currency != 'ZAR' else None
             account_purpose = determine_account_purpose(row, acc_type)
             
             is_primary = customer_id not in customer_primary_accounts
             if is_primary:
-                customer_primary_accounts[customer_id] = f'ACC{account_id_counter:07d}'
+                customer_primary_accounts[customer_id] = f'ACC{global_id:07d}'
             
             statement_frequency = random.choice(['monthly', 'quarterly'])
             online_banking_enabled = (random.random() < 0.95 if channel_details['opening_channel'] in ['online', 'mobile_app'] else random.random() < 0.95)
@@ -714,7 +760,7 @@ def generate_accounts(year):
             cross_border_enabled = currency != 'ZAR' or random.random() < 0.5
 
             accounts.append({
-                'account_id': f'ACC{account_id_counter:07d}',
+                'account_id': f'ACC{global_id:07d}',
                 'account_number': account_number,
                 'customer_id': customer_id,
                 'account_type': acc_type,
@@ -754,19 +800,16 @@ def generate_accounts(year):
                 **requirements,
                 **channel_details
             })
-            account_id_counter += 1
             customer_account_counts[customer_id] = customer_account_counts.get(customer_id, 0) + 1
 
-    # Create DataFrames
+    # Create DataFrames and save
     df_accounts = pd.DataFrame(accounts)
     df_rejected = pd.DataFrame(rejected_applications)
     
-    # Save accounts
     os.makedirs(github_repo_path, exist_ok=True)
     output_file = f'{github_repo_path}/accounts_{year}.parquet'
     df_accounts.to_parquet(output_file, index=False)
 
-    # Save rejected applications
     if len(df_rejected) > 0:
         rejected_file = f'{github_repo_path}/rejected_applications_{year}.parquet'
         df_rejected.to_parquet(rejected_file, index=False)
@@ -774,9 +817,9 @@ def generate_accounts(year):
         print(f"Saved to {rejected_file}")
 
     print(f"Generated {len(df_accounts)} accounts for year {year}.")
+    print(f"Final counter: {counter.peek()}")
     print(f"Saved to {output_file}")
     
-    # Summary statistics
     if len(df_accounts) > 0:
         print("\nAccount Summary:")
         print(f"- Primary accounts: {df_accounts['is_primary_account'].sum()}")
