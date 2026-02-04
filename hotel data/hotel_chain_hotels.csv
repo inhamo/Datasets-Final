@@ -1,0 +1,21 @@
+hotel_id,hotel_name,chain,city,region,country,star_rating,num_floors,total_rooms,has_pool,has_gym,has_spa,year_opened
+d9bf33b8-1840-414d-98c6-28783bd17201,Grand Hotels London,Grand Hotels,London,Europe,UK,4,9,108,True,False,True,2006
+d743f084-fd74-4205-b68d-acad7a3a34e2,Boutique Collection Barcelona,Boutique Collection,Barcelona,Europe,Spain,4,22,264,True,False,True,2008
+974b3938-3023-4759-9f8c-daacfda36367,Boutique Collection Paris,Boutique Collection,Paris,Europe,France,4,22,418,False,True,True,2008
+b393df01-b9f6-44e9-a49b-45f22af0b8a8,Resort World Marrakech,Resort World,Marrakech,Africa,Unknown,4,22,484,True,True,True,2003
+d2d83a60-370d-4215-a8a6-15ce82b07433,Urban Stays Amsterdam,Urban Stays,Amsterdam,Europe,Netherlands,3,8,208,True,False,False,1995
+13fae215-880f-4dd4-9529-85df3c9ec1d8,Resort World Doha,Resort World,Doha,Middle East,Qatar,4,15,450,True,False,False,2018
+a10e66d8-5c09-4d20-a7c0-e5ec43908492,Resort World Abu Dhabi,Resort World,Abu Dhabi,Middle East,UAE,4,13,312,False,True,True,1997
+bb42f9ba-4578-485d-81cc-e2774c3552db,Budget Inn Los Angeles,Budget Inn,Los Angeles,North America,USA,2,8,272,True,True,False,1990
+8da04597-1602-4508-ab7a-7c081b52c59e,Urban Stays Los Angeles,Urban Stays,Los Angeles,North America,USA,3,10,240,True,False,False,2010
+65000fe5-e74c-4703-b7d2-27d95203eb15,Grand Hotels London,Grand Hotels,London,Europe,UK,4,12,204,False,True,False,1995
+a61368da-9932-4554-bfff-79dd0c602025,Luxury Collection Paris,Luxury Collection,Paris,Europe,France,5,16,256,True,True,False,2005
+db51cafb-0dc8-424d-a78c-49866f1ad693,Grand Hotels London,Grand Hotels,London,Europe,UK,4,25,400,True,False,False,2004
+08dba775-c5f4-436b-ad10-23c3da8bd9a4,Budget Inn Sydney,Budget Inn,Sydney,Asia Pacific,Australia,2,7,210,True,True,False,1990
+17b2b39e-75d8-4b0f-8d44-9537ce323cb3,Urban Stays Paris,Urban Stays,Paris,Europe,France,3,18,576,True,True,False,1999
+4802786c-82dd-43e1-9412-75ee46bbbdee,Budget Inn Miami,Budget Inn,Miami,North America,Unknown,2,13,481,True,True,False,1995
+ddd34ffe-d3b4-4d0c-971a-c20f4049708a,Boutique Collection Vienna,Boutique Collection,Vienna,Europe,Unknown,4,14,196,False,True,True,2014
+88802493-688a-4811-8796-717ec212967b,Grand Hotels London,Grand Hotels,London,Europe,UK,4,11,330,True,True,True,2000
+672923c4-b222-47b7-921c-dfe6c663a13b,Grand Hotels Rome,Grand Hotels,Rome,Europe,Italy,4,20,500,False,True,True,2015
+e4ff9a07-fb06-4ca6-9caa-3da83ded792b,Business Suites London,Business Suites,London,Europe,UK,3,9,153,True,True,False,2017
+f4528b0f-34bf-46d4-97b3-26644215ff7d,Grand Hotels Tokyo,Grand Hotels,Tokyo,Asia Pacific,Japan,4,23,345,False,False,True,1990
