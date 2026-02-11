@@ -1,0 +1,21 @@
+hotel_id,hotel_name,chain,city,region,country,star_rating,num_floors,total_rooms,has_pool,has_gym,has_spa,year_opened
+82958c98-18a5-4f9a-9695-04f292b4abb2,Budget Inn Seoul,Budget Inn,Seoul,Asia Pacific,Unknown,2,11,528,True,True,False,2008
+d9351079-2735-48d4-806a-036feb20d510,Grand Hotels Sydney,Grand Hotels,Sydney,Asia Pacific,Australia,4,10,140,True,True,True,2011
+1f052317-a69e-443c-970a-d0ce7fdfee16,Grand Hotels Barcelona,Grand Hotels,Barcelona,Europe,Spain,4,6,174,True,False,False,2002
+558507fd-547a-4b3d-a9a7-d15f573034fe,Resort World Dubai,Resort World,Dubai,Middle East,UAE,4,16,464,False,False,True,1998
+5a9e196b-0b2e-4885-b4a5-6e0ca34a447f,Business Suites New York,Business Suites,New York,North America,USA,3,9,198,False,False,False,2014
+f86b921c-ec95-46d3-9613-0c7ef41988dd,Luxury Collection London,Luxury Collection,London,Europe,UK,5,18,180,True,False,True,2007
+5f1314ae-58f3-4493-be83-66232a7424b4,Grand Hotels London,Grand Hotels,London,Europe,UK,4,9,189,False,True,True,1994
+cc3acdad-11d2-445b-97ab-817695d9c105,Boutique Collection Amsterdam,Boutique Collection,Amsterdam,Europe,Netherlands,4,24,504,False,True,True,2016
+15169fca-5f59-4bd3-8909-6ae505821ea0,Express Hotels Bangkok,Express Hotels,Bangkok,Asia Pacific,Thailand,2,5,225,True,True,False,2015
+2698433a-0c7a-410f-a90f-f5d2f51f7243,Grand Hotels Vienna,Grand Hotels,Vienna,Europe,Unknown,4,21,546,False,True,True,2023
+3ecfc097-5a1c-4e7a-af27-4c9d1640128e,Boutique Collection Barcelona,Boutique Collection,Barcelona,Europe,Spain,4,21,315,False,True,True,2009
+8ec63e15-9beb-4b53-bef8-eabde12f3b69,Express Hotels Amsterdam,Express Hotels,Amsterdam,Europe,Netherlands,2,12,588,True,False,False,2003
+5b08fb70-0e9e-4581-9704-6f2ad41af4da,Express Hotels Sydney,Express Hotels,Sydney,Asia Pacific,Australia,2,14,588,True,True,False,2022
+0135ec0c-b013-43a1-a93e-9d9e4ef334e5,Urban Stays Chicago,Urban Stays,Chicago,North America,USA,3,13,494,True,False,False,2008
+1f54f7fa-2970-49c4-802b-105de2e71374,Boutique Collection London,Boutique Collection,London,Europe,UK,4,10,200,False,False,False,2002
+41d2f7ff-657f-4a6a-8dd1-a841c5b27500,Business Suites Miami,Business Suites,Miami,North America,Unknown,3,13,494,True,True,False,2004
+71d501b8-dc26-48e3-820c-40ec6a01592e,Budget Inn Toronto,Budget Inn,Toronto,North America,Canada,2,13,273,True,False,False,1990
+940ab2e0-4917-43dc-88de-5c1e52f01349,Resort World Bangkok,Resort World,Bangkok,Asia Pacific,Thailand,4,12,312,True,True,True,2015
+1ef1ff2b-5d99-4f4f-b516-95556b570964,Resort World Marrakech,Resort World,Marrakech,Africa,Unknown,4,19,532,True,True,True,1992
+93f89bf5-e5f1-4f68-8656-09f7162e8235,Express Hotels Tokyo,Express Hotels,Tokyo,Asia Pacific,Japan,2,8,256,True,False,False,2013
